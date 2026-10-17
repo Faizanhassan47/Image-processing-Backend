@@ -415,6 +415,11 @@ CREATE TABLE report_findings (
 
         db.commit()
 
+        try:
+            from ai_engine import init_ai_schema
+            init_ai_schema(connect)
+        except Exception:
+            pass
 
 
 init_db()
@@ -514,10 +519,14 @@ def clear_slide_meta_cache():
 @asynccontextmanager
 async def lifespan(_app):
     from platform_api import watched_folder_loop
+    from ai_engine import hovernet_manager
     stop_event=asyncio.Event(); watcher=asyncio.create_task(watched_folder_loop(connect,stop_event))
     try: yield
     finally:
-        stop_event.set(); await watcher; slide_cache.clear()
+        stop_event.set()
+        await watcher
+        slide_cache.clear()
+        hovernet_manager.stop_worker()
 
 
 app = FastAPI(title=os.getenv("APP_NAME", "Pathology Demo API"), lifespan=lifespan)
@@ -1759,3 +1768,9 @@ def export_report_html(report_id: int):
 from platform_api import create_platform_router, init_platform_schema
 init_platform_schema(connect)
 app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS, openslide))
+
+# HoVer-Net AI Analysis API
+from ai_engine import init_ai_schema
+from ai_api import create_ai_router
+init_ai_schema(connect)
+app.include_router(create_ai_router(connect, require_roles, get_current_user, get_slide, get_case, _stored_path))

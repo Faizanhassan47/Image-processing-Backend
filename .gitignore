@@ -7,3 +7,4 @@ pytest_*/
 testdata/
 .venv/
 .env
+storage/
