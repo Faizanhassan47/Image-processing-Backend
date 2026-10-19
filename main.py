@@ -418,6 +418,11 @@ CREATE TABLE report_findings (
 
         db.commit()
 
+        try:
+            from ai_engine import init_ai_schema
+            init_ai_schema(connect)
+        except Exception:
+            pass
 
 
 init_db()
@@ -517,10 +522,14 @@ def clear_slide_meta_cache():
 @asynccontextmanager
 async def lifespan(_app):
     from platform_api import watched_folder_loop
+    from ai_engine import hovernet_manager
     stop_event=asyncio.Event(); watcher=asyncio.create_task(watched_folder_loop(connect,stop_event))
     try: yield
     finally:
-        stop_event.set(); await watcher; slide_cache.clear()
+        stop_event.set()
+        await watcher
+        slide_cache.clear()
+        hovernet_manager.stop_worker()
 
 
 app = FastAPI(title=os.getenv("APP_NAME", "Pathology Demo API"), lifespan=lifespan)
@@ -814,7 +823,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()],
     allow_credentials=env_bool("CORS_ALLOW_CREDENTIALS", False),
-    allow_methods=[method.strip() for method in os.getenv("CORS_ALLOW_METHODS", "GET,POST,PATCH,OPTIONS").split(",") if method.strip()],
+    allow_methods=[method.strip() for method in os.getenv("CORS_ALLOW_METHODS", "GET,POST,PATCH,DELETE,OPTIONS").split(",") if method.strip()],
     allow_headers=["*"],
 )
 
@@ -1774,8 +1783,14 @@ def export_report_html(report_id: int):
     return Response(document,media_type="text/html",headers={"Content-Disposition":f"attachment; filename=report_{case['case_id']}_v{report['version']}.html"})
 
 
-# Centralized Services APIs are registered through the services layer
-from services.api import create_services_router, init_services_schemas
-init_services_schemas(connect)
-app.include_router(create_services_router(connect, require_roles, get_current_user, audit, UPLOADS, openslide))
+# Enterprise extension APIs are registered after the core dependencies exist to
+# avoid coupling their adapter contracts to FastAPI application construction.
+from platform_api import create_platform_router, init_platform_schema
+init_platform_schema(connect)
+app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS, openslide))
 
+# HoVer-Net AI Analysis API
+from ai_engine import init_ai_schema
+from ai_api import create_ai_router
+init_ai_schema(connect)
+app.include_router(create_ai_router(connect, require_roles, get_current_user, get_slide, get_case, _stored_path))

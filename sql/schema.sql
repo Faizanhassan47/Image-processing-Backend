@@ -554,6 +554,40 @@ CREATE TABLE dbo.backup_runs (
     started_at DATETIME2 NOT NULL CONSTRAINT DF_backup_runs_started DEFAULT (SYSUTCDATETIME()),
     completed_at DATETIME2 NULL
 );
+IF OBJECT_ID('dbo.ai_analyses', 'U') IS NULL
+CREATE TABLE dbo.ai_analyses (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_ai_analyses PRIMARY KEY,
+    slide_id INT NOT NULL CONSTRAINT FK_ai_analyses_slide REFERENCES dbo.slides(id),
+    case_id INT NOT NULL CONSTRAINT FK_ai_analyses_case REFERENCES dbo.cases(id),
+    requested_by VARCHAR(255) NOT NULL,
+    model_name VARCHAR(255) NOT NULL CONSTRAINT DF_ai_analyses_model_name DEFAULT ('HoVer-Net FAST'),
+    model_version VARCHAR(120) NOT NULL CONSTRAINT DF_ai_analyses_model_version DEFAULT ('PanNuke-Fold1'),
+    status VARCHAR(30) NOT NULL CONSTRAINT DF_ai_analyses_status DEFAULT ('Completed'),
+    roi_x INT NOT NULL,
+    roi_y INT NOT NULL,
+    roi_width INT NOT NULL,
+    roi_height INT NOT NULL,
+    roi_level INT NOT NULL CONSTRAINT DF_ai_analyses_level DEFAULT (0),
+    total_nuclei INT NOT NULL CONSTRAINT DF_ai_analyses_total DEFAULT (0),
+    neoplastic_count INT NOT NULL CONSTRAINT DF_ai_analyses_neopla DEFAULT (0),
+    inflammatory_count INT NOT NULL CONSTRAINT DF_ai_analyses_inflam DEFAULT (0),
+    connective_count INT NOT NULL CONSTRAINT DF_ai_analyses_connec DEFAULT (0),
+    necrotic_count INT NOT NULL CONSTRAINT DF_ai_analyses_necros DEFAULT (0),
+    non_neoplastic_count INT NOT NULL CONSTRAINT DF_ai_analyses_noneo DEFAULT (0),
+    no_label_count INT NOT NULL CONSTRAINT DF_ai_analyses_nolabe DEFAULT (0),
+    nuclear_density FLOAT NULL,
+    avg_confidence FLOAT NULL,
+    summary_json VARCHAR(MAX) NULL,
+    predictions_json VARCHAR(MAX) NULL,
+    gallery_json VARCHAR(MAX) NULL,
+    roi_image_filename VARCHAR(255) NULL,
+    overlay_image_filename VARCHAR(255) NULL,
+    report_pdf_filename VARCHAR(255) NULL,
+    error_detail VARCHAR(MAX) NULL,
+    disclaimer VARCHAR(500) NOT NULL CONSTRAINT DF_ai_analyses_disclaimer DEFAULT ('Research Use Only — Not for Clinical Diagnosis'),
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_ai_analyses_created DEFAULT (SYSUTCDATETIME()),
+    completed_at DATETIME2 NULL
+);
 GO
 
 /* Patient profile and longitudinal clinical history. */
@@ -714,6 +748,8 @@ CREATE TABLE dbo.patient_imports (
 GO
 
 /* Query indexes used by the API. */
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ai_analyses_slide_id' AND object_id=OBJECT_ID('dbo.ai_analyses')) CREATE INDEX idx_ai_analyses_slide_id ON dbo.ai_analyses(slide_id, id DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ai_analyses_case_id' AND object_id=OBJECT_ID('dbo.ai_analyses')) CREATE INDEX idx_ai_analyses_case_id ON dbo.ai_analyses(case_id, id DESC);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_slides_case_id' AND object_id=OBJECT_ID('dbo.slides')) CREATE INDEX idx_slides_case_id ON dbo.slides(case_id,id);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_slide_qc_history_slide_id' AND object_id=OBJECT_ID('dbo.slide_qc_history')) CREATE INDEX idx_slide_qc_history_slide_id ON dbo.slide_qc_history(slide_id,id);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_annotations_slide_id' AND object_id=OBJECT_ID('dbo.annotations')) CREATE INDEX idx_annotations_slide_id ON dbo.annotations(slide_id,id);
