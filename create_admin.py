@@ -1,4 +1,4 @@
-"""Provision the only two protected local Super Administrator accounts."""
+"""Provision the two protected local Super Administrator accounts."""
 
 import getpass
 import os

@@ -356,12 +356,12 @@ async def watched_folder_loop(connect, stop_event):
 def create_platform_router(connect, require_roles, get_current_user, uploads_dir: Path, openslide_module=None):
     router = APIRouter(prefix='/api/platform', tags=['platform'])
     administrators = ['System Administrator']
-    intake_roles = ['System Administrator', 'Histotechnologist']
-    ai_roles = ['System Administrator', 'Pathologist', 'AI Analyst']
-    integration_roles = ['System Administrator', 'Integration Engineer']
+    intake_roles = ['System Administrator', 'Laboratory Manager']
+    ai_roles = ['System Administrator', 'Pathologist']
+    integration_roles = ['System Administrator']
     operational_roles = ['System Administrator', 'Laboratory Manager']
-    clinical_read_roles = ['System Administrator', 'Laboratory Manager', 'Pathologist', 'Histotechnologist', 'AI Analyst', 'Auditor']
-    audit_roles = ['System Administrator', 'Auditor']
+    clinical_read_roles = ['System Administrator', 'Laboratory Manager', 'Pathologist']
+    audit_roles = ['System Administrator']
     quarantine_dir = Path(os.getenv('QUARANTINE_DIR', uploads_dir.parent / 'quarantine'))
     if not quarantine_dir.is_absolute(): quarantine_dir = uploads_dir.parent / quarantine_dir
     quarantine_dir.mkdir(parents=True, exist_ok=True)
@@ -422,7 +422,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         return _rows(connect,'SELECT * FROM viewer_bookmarks WHERE slide_id=? ORDER BY id DESC',(slide_id,))
 
     @router.post('/slides/{slide_id}/bookmarks',status_code=201)
-    def create_viewer_bookmark(slide_id:int,item:ViewerBookmarkCreate,user=Depends(require_roles(['System Administrator','Pathologist','Histotechnologist','AI Analyst']))):
+    def create_viewer_bookmark(slide_id:int,item:ViewerBookmarkCreate,user=Depends(require_roles(['System Administrator','Pathologist']))):
         with connect() as db:
             if not db.execute('SELECT id FROM slides WHERE id=?',(slide_id,)).fetchone(): raise HTTPException(404,'Slide not found')
             cur=db.execute('INSERT INTO viewer_bookmarks (slide_id,name,viewport_x,viewport_y,viewport_width,viewport_height,rotation,created_by) VALUES (?,?,?,?,?,?,?,?)',
@@ -430,11 +430,11 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         return {'id':cur.lastrowid,'slide_id':slide_id,**item.model_dump(),'created_by':user['username']}
 
     @router.delete('/slides/{slide_id}/bookmarks/{bookmark_id}',status_code=204)
-    def delete_viewer_bookmark(slide_id:int,bookmark_id:int,user=Depends(require_roles(['System Administrator','Pathologist','Histotechnologist','AI Analyst']))):
+    def delete_viewer_bookmark(slide_id:int,bookmark_id:int,user=Depends(require_roles(['System Administrator','Pathologist']))):
         with connect() as db:
             row=db.execute('SELECT created_by FROM viewer_bookmarks WHERE id=? AND slide_id=?',(bookmark_id,slide_id)).fetchone()
             if not row: raise HTTPException(404,'Bookmark not found')
-            if user['role'] not in {'Super Administrator','System Administrator'} and row['created_by'] != user['username']: raise HTTPException(403,'Only the bookmark owner can delete it')
+            if user['role'] not in {'System Administrator','Super Administrator'} and row['created_by'] != user['username']: raise HTTPException(403,'Only the bookmark owner can delete it')
             db.execute('DELETE FROM viewer_bookmarks WHERE id=?',(bookmark_id,)); db.commit()
 
     @router.get('/slides/{slide_id}/viewer-preferences')
@@ -586,13 +586,13 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
     def create_consultation(case_id:int,item:ConsultationCreate,user=Depends(require_roles(['System Administrator','Pathologist']))):
         with connect() as db:
             consultant=db.execute('SELECT username,role,is_active FROM users WHERE username=?',(item.consultant_username,)).fetchone()
-            if not consultant or not consultant['is_active'] or consultant['role'] not in {'Pathologist','Super Administrator','System Administrator'}: raise HTTPException(400,'Consultant must be an active authorized clinical account')
+            if not consultant or not consultant['is_active'] or consultant['role'] not in {'Pathologist','System Administrator'}: raise HTTPException(400,'Consultant must be an active authorized clinical account')
             if not db.execute('SELECT id FROM cases WHERE id=?',(case_id,)).fetchone(): raise HTTPException(404,'Case not found')
             cur=db.execute('INSERT INTO case_consultations (case_id,requested_by,consultant_username,message) VALUES (?,?,?,?)',(case_id,user['username'],item.consultant_username,item.message)); db.commit()
         return {'id':cur.lastrowid,'case_id':case_id,**item.model_dump(),'status':'Open'}
 
     @router.post('/research-folders',status_code=201)
-    def create_research_folder(item:ResearchFolderCreate,user=Depends(require_roles(['System Administrator','AI Analyst']))):
+    def create_research_folder(item:ResearchFolderCreate,user=Depends(require_roles(['System Administrator']))):
         permitted=set(clinical_read_roles); invalid=set(item.allowed_roles)-permitted
         if invalid: raise HTTPException(400,f"Invalid allowed roles: {', '.join(sorted(invalid))}")
         with connect() as db:
@@ -603,11 +603,11 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
 
     @router.get('/research-folders')
     def research_folders(user=Depends(require_roles(clinical_read_roles))):
-        if user['role'] in {'Super Administrator','System Administrator'}: return _rows(connect,'SELECT * FROM research_folders ORDER BY id DESC')
+        if user['role'] in {'System Administrator','Super Administrator'}: return _rows(connect,'SELECT * FROM research_folders ORDER BY id DESC')
         return _rows(connect,'SELECT f.* FROM research_folders f JOIN research_folder_access a ON a.folder_id=f.id WHERE a.role_name=? ORDER BY f.id DESC',(user['role'],))
 
     @router.post('/research-folders/{folder_id}/members',status_code=201)
-    def add_folder_member(folder_id:int,item:FolderMemberCreate,user=Depends(require_roles(['System Administrator','AI Analyst']))):
+    def add_folder_member(folder_id:int,item:FolderMemberCreate,user=Depends(require_roles(['System Administrator']))):
         with connect() as db:
             if not db.execute('SELECT id FROM research_folders WHERE id=?',(folder_id,)).fetchone(): raise HTTPException(404,'Research folder not found')
             if not db.execute('SELECT id FROM cases WHERE id=?',(item.case_id,)).fetchone(): raise HTTPException(404,'Case not found')
@@ -930,7 +930,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
     def models(_=Depends(require_roles(ai_roles))): return _rows(connect, 'SELECT * FROM ai_models ORDER BY name, version DESC')
 
     @router.post('/ai/models', status_code=201)
-    def create_model(item: ModelCreate, user=Depends(require_roles(administrators + ['AI Analyst']))):
+    def create_model(item: ModelCreate, user=Depends(require_roles(administrators))):
         if item.approval_status not in {'Research','Validated','Retired'}: raise HTTPException(400, 'Invalid approval status')
         with connect() as db:
             cur=db.execute('INSERT INTO ai_models (name,version,checksum,task,intended_use,compatible_inputs,limitations,approval_status,adapter_name) VALUES (?,?,?,?,?,?,?,?,?)',
@@ -957,7 +957,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             return {'id':cur.lastrowid,'correlation_id':cid,'status':'Queued'}
 
     @router.patch('/ai/jobs/{job_id}')
-    def update_ai_job(job_id:int,item:JobStatusUpdate,_=Depends(require_roles(administrators + ['AI Analyst']))):
+    def update_ai_job(job_id:int,item:JobStatusUpdate,_=Depends(require_roles(administrators))):
         allowed={'Queued','Running','Completed','Failed','Cancelled'}
         if item.status not in allowed: raise HTTPException(400,'Invalid AI job status')
         with connect() as db:
@@ -976,7 +976,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         return rows
 
     @router.post('/ai/jobs/{job_id}/results',status_code=201)
-    def create_ai_result(job_id:int,item:AiResultCreate,_=Depends(require_roles(administrators + ['AI Analyst']))):
+    def create_ai_result(job_id:int,item:AiResultCreate,_=Depends(require_roles(administrators))):
         with connect() as db:
             cur=db.execute('INSERT INTO ai_results (ai_job_id,result_type,geometry_json,measurements_json,confidence,raw_output_json) VALUES (?,?,?,?,?,?)',(job_id,item.result_type,json.dumps(item.geometry),json.dumps(item.measurements),item.confidence,json.dumps(item.raw_output))); db.commit()
             return {'id':cur.lastrowid,'ai_job_id':job_id,**item.model_dump()}
@@ -1026,7 +1026,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         return {'id':event_id,'acknowledgement':ack,'status':'Acknowledged' if accepted else 'Rejected'}
 
     @router.get('/health')
-    def health(request: Request, _=Depends(require_roles(operational_roles + ['Integration Engineer']))):
+    def health(request: Request, _=Depends(require_roles(operational_roles))):
         usage=shutil.disk_usage(uploads_dir); db_ok=True
         try:
             with connect() as db: db.execute('SELECT 1').fetchone()

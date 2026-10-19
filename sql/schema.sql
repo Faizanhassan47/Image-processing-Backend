@@ -8,6 +8,8 @@
 
 SET NOCOUNT ON;
 SET XACT_ABORT ON;
+SET ANSI_NULLS ON;
+SET QUOTED_IDENTIFIER ON;
 GO
 
 IF OBJECT_ID('dbo.slides','U') IS NOT NULL AND COL_LENGTH('dbo.slides', 'qc_unusual_staining') IS NULL
@@ -29,16 +31,20 @@ CREATE TABLE dbo.users (
 );
 GO
 
--- Idempotent migration from the original prototype role names.
+-- Idempotent migration to the approved three-role catalogue.
 UPDATE dbo.users SET role = 'System Administrator' WHERE role = 'Admin';
-UPDATE dbo.users SET role = 'Histotechnologist' WHERE role = 'Technician';
-UPDATE dbo.users SET role = 'Auditor' WHERE role = 'Viewer';
+UPDATE dbo.users SET role = 'Laboratory Manager' WHERE role IN ('Technician', 'Histotechnologist');
+UPDATE dbo.users SET role = 'Pathologist' WHERE role = 'AI Analyst';
+-- Ambiguous retired read-only/integration accounts are disabled for explicit administrator review.
+UPDATE dbo.users SET role = 'Laboratory Manager', is_active = 0 WHERE role IN ('Viewer', 'Auditor', 'Integration Engineer');
 IF NOT EXISTS (SELECT 1 FROM dbo.users WHERE LOWER(username) = 'etdadmin')
     UPDATE dbo.users SET username = 'ETDadmin' WHERE LOWER(username) = 'eidadmin';
-UPDATE dbo.users SET role = 'Super Administrator' WHERE LOWER(username) IN ('etddev', 'etdadmin');
-IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_users_super_admin_reserved')
-    ALTER TABLE dbo.users ADD CONSTRAINT CK_users_super_admin_reserved
-        CHECK (role <> 'Super Administrator' OR LOWER(username) IN ('etddev', 'etdadmin'));
+UPDATE dbo.users SET role = 'System Administrator', is_active = 1 WHERE LOWER(username) IN ('etddev', 'etdadmin');
+IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_users_super_admin_reserved')
+    ALTER TABLE dbo.users DROP CONSTRAINT CK_users_super_admin_reserved;
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name = 'CK_users_approved_roles')
+    ALTER TABLE dbo.users ADD CONSTRAINT CK_users_approved_roles
+        CHECK (role IN ('System Administrator', 'Laboratory Manager', 'Pathologist'));
 GO
 
 IF OBJECT_ID('dbo.cases', 'U') IS NULL
@@ -584,6 +590,163 @@ CREATE TABLE dbo.ai_analyses (
 );
 GO
 
+/* Patient profile and longitudinal clinical history. */
+IF COL_LENGTH('dbo.patients','patient_identifier') IS NULL ALTER TABLE dbo.patients ADD patient_identifier VARCHAR(64) NULL;
+IF COL_LENGTH('dbo.patients','medical_record_number') IS NULL ALTER TABLE dbo.patients ADD medical_record_number VARCHAR(120) NULL;
+IF COL_LENGTH('dbo.patients','first_name') IS NULL ALTER TABLE dbo.patients ADD first_name NVARCHAR(120) NULL;
+IF COL_LENGTH('dbo.patients','middle_name') IS NULL ALTER TABLE dbo.patients ADD middle_name NVARCHAR(120) NULL;
+IF COL_LENGTH('dbo.patients','last_name') IS NULL ALTER TABLE dbo.patients ADD last_name NVARCHAR(120) NULL;
+IF COL_LENGTH('dbo.patients','date_of_birth') IS NULL ALTER TABLE dbo.patients ADD date_of_birth DATE NULL;
+IF COL_LENGTH('dbo.patients','sex') IS NULL ALTER TABLE dbo.patients ADD sex VARCHAR(30) NULL;
+IF COL_LENGTH('dbo.patients','gender_identity') IS NULL ALTER TABLE dbo.patients ADD gender_identity NVARCHAR(80) NULL;
+IF COL_LENGTH('dbo.patients','blood_group') IS NULL ALTER TABLE dbo.patients ADD blood_group VARCHAR(10) NULL;
+IF COL_LENGTH('dbo.patients','phone') IS NULL ALTER TABLE dbo.patients ADD phone VARCHAR(40) NULL;
+IF COL_LENGTH('dbo.patients','address') IS NULL ALTER TABLE dbo.patients ADD address NVARCHAR(1000) NULL;
+IF COL_LENGTH('dbo.patients','status') IS NULL ALTER TABLE dbo.patients ADD status VARCHAR(30) NOT NULL CONSTRAINT DF_patients_status DEFAULT ('Active');
+IF COL_LENGTH('dbo.patients','demographics_json') IS NULL ALTER TABLE dbo.patients ADD demographics_json NVARCHAR(MAX) NULL;
+IF COL_LENGTH('dbo.patients','created_by') IS NULL ALTER TABLE dbo.patients ADD created_by VARCHAR(255) NULL;
+IF COL_LENGTH('dbo.patients','updated_by') IS NULL ALTER TABLE dbo.patients ADD updated_by VARCHAR(255) NULL;
+IF COL_LENGTH('dbo.patients','updated_at') IS NULL ALTER TABLE dbo.patients ADD updated_at DATETIME2 NOT NULL CONSTRAINT DF_patients_updated DEFAULT (SYSUTCDATETIME());
+IF COL_LENGTH('dbo.patients','archived_at') IS NULL ALTER TABLE dbo.patients ADD archived_at DATETIME2 NULL;
+GO
+UPDATE dbo.patients SET patient_identifier=CONCAT('PAT-',RIGHT(CONCAT('000000',CAST(id AS VARCHAR(20))),6)) WHERE patient_identifier IS NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_identifier' AND object_id=OBJECT_ID('dbo.patients')) CREATE UNIQUE INDEX UQ_patients_identifier ON dbo.patients(patient_identifier) WHERE patient_identifier IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_mrn' AND object_id=OBJECT_ID('dbo.patients')) CREATE UNIQUE INDEX UQ_patients_mrn ON dbo.patients(medical_record_number) WHERE medical_record_number IS NOT NULL;
+IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_patients_demographics_json') ALTER TABLE dbo.patients ADD CONSTRAINT CK_patients_demographics_json CHECK (demographics_json IS NULL OR ISJSON(demographics_json)=1);
+GO
+
+IF OBJECT_ID('dbo.patient_identity_mappings','U') IS NULL
+CREATE TABLE dbo.patient_identity_mappings (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_identity_mappings PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_identity_patient REFERENCES dbo.patients(id),
+    authority VARCHAR(120) NOT NULL, identifier_value VARCHAR(255) NOT NULL,
+    identifier_type VARCHAR(80) NOT NULL CONSTRAINT DF_patient_identity_type DEFAULT ('External'),
+    is_primary BIT NOT NULL CONSTRAINT DF_patient_identity_primary DEFAULT (0),
+    created_by VARCHAR(255) NOT NULL, created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_identity_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_patient_identity_mapping UNIQUE(authority,identifier_value)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_medical_history','U') IS NULL
+CREATE TABLE dbo.patient_medical_history (
+    patient_id INT NOT NULL CONSTRAINT PK_patient_medical_history PRIMARY KEY CONSTRAINT FK_patient_history_patient REFERENCES dbo.patients(id),
+    schema_version VARCHAR(20) NOT NULL CONSTRAINT DF_patient_history_schema DEFAULT ('1.0'),
+    history_json NVARCHAR(MAX) NOT NULL CONSTRAINT DF_patient_history_json DEFAULT ('{}'),
+    revision_number INT NOT NULL CONSTRAINT DF_patient_history_revision DEFAULT (1),
+    created_by VARCHAR(255) NOT NULL, updated_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_history_created DEFAULT (SYSUTCDATETIME()),
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_patient_history_updated DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT CK_patient_medical_history_json CHECK (ISJSON(history_json)=1)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_medical_history_revisions','U') IS NULL
+CREATE TABLE dbo.patient_medical_history_revisions (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_medical_history_revisions PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_history_revision_patient REFERENCES dbo.patients(id),
+    revision_number INT NOT NULL, schema_version VARCHAR(20) NOT NULL, history_json NVARCHAR(MAX) NOT NULL,
+    changed_by VARCHAR(255) NOT NULL, change_reason NVARCHAR(1000) NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_history_revision_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_patient_history_revision UNIQUE(patient_id,revision_number),
+    CONSTRAINT CK_patient_history_revision_json CHECK (ISJSON(history_json)=1)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_encounters','U') IS NULL
+CREATE TABLE dbo.patient_encounters (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_encounters PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_encounter_patient REFERENCES dbo.patients(id),
+    encounter_identifier VARCHAR(120) NOT NULL, encounter_type VARCHAR(80) NOT NULL,
+    status VARCHAR(30) NOT NULL CONSTRAINT DF_patient_encounter_status DEFAULT ('Open'),
+    occurred_at DATETIME2 NOT NULL, ended_at DATETIME2 NULL, location NVARCHAR(255) NULL, clinician VARCHAR(255) NULL,
+    metadata_json NVARCHAR(MAX) NULL, created_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_encounter_created DEFAULT (SYSUTCDATETIME()),
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_patient_encounter_updated DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_patient_encounter UNIQUE(patient_id,encounter_identifier),
+    CONSTRAINT CK_patient_encounter_json CHECK (metadata_json IS NULL OR ISJSON(metadata_json)=1)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_tests','U') IS NULL
+CREATE TABLE dbo.patient_tests (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_tests PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_test_patient REFERENCES dbo.patients(id),
+    encounter_id INT NULL CONSTRAINT FK_patient_test_encounter REFERENCES dbo.patient_encounters(id),
+    case_id INT NULL CONSTRAINT FK_patient_test_case REFERENCES dbo.cases(id),
+    report_id INT NULL CONSTRAINT FK_patient_test_report REFERENCES dbo.reports(id),
+    test_identifier VARCHAR(120) NOT NULL, test_name NVARCHAR(255) NOT NULL, test_category VARCHAR(100) NOT NULL,
+    order_date DATETIME2 NULL, collection_date DATETIME2 NULL, result_date DATETIME2 NULL,
+    status VARCHAR(30) NOT NULL CONSTRAINT DF_patient_test_status DEFAULT ('Ordered'),
+    summary_result NVARCHAR(2000) NULL, source_system VARCHAR(120) NOT NULL CONSTRAINT DF_patient_test_source DEFAULT ('Digital Pathology'),
+    provenance_json NVARCHAR(MAX) NULL, created_by VARCHAR(255) NOT NULL, updated_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_test_created DEFAULT (SYSUTCDATETIME()),
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_patient_test_updated DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_patient_test_identifier UNIQUE(patient_id,test_identifier),
+    CONSTRAINT CK_patient_test_provenance_json CHECK (provenance_json IS NULL OR ISJSON(provenance_json)=1)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_test_results','U') IS NULL
+CREATE TABLE dbo.patient_test_results (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_test_results PRIMARY KEY,
+    test_id INT NOT NULL CONSTRAINT FK_patient_test_result_test REFERENCES dbo.patient_tests(id),
+    analyte_name NVARCHAR(255) NOT NULL, result_value NVARCHAR(1000) NULL,
+    result_type VARCHAR(40) NOT NULL CONSTRAINT DF_patient_test_result_type DEFAULT ('Text'),
+    unit NVARCHAR(80) NULL, reference_range NVARCHAR(255) NULL, abnormal_flag VARCHAR(30) NULL,
+    result_json NVARCHAR(MAX) NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_test_result_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT CK_patient_test_result_json CHECK (result_json IS NULL OR ISJSON(result_json)=1)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_clinical_notes','U') IS NULL
+CREATE TABLE dbo.patient_clinical_notes (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_clinical_notes PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_note_patient REFERENCES dbo.patients(id),
+    case_id INT NULL CONSTRAINT FK_patient_note_case REFERENCES dbo.cases(id),
+    encounter_id INT NULL CONSTRAINT FK_patient_note_encounter REFERENCES dbo.patient_encounters(id),
+    note_type VARCHAR(80) NOT NULL CONSTRAINT DF_patient_note_type DEFAULT ('Clinical'), note_text NVARCHAR(MAX) NOT NULL,
+    revision_number INT NOT NULL CONSTRAINT DF_patient_note_revision DEFAULT (1), is_archived BIT NOT NULL CONSTRAINT DF_patient_note_archived DEFAULT (0),
+    created_by VARCHAR(255) NOT NULL, updated_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_note_created DEFAULT (SYSUTCDATETIME()),
+    updated_at DATETIME2 NOT NULL CONSTRAINT DF_patient_note_updated DEFAULT (SYSUTCDATETIME())
+);
+GO
+
+IF OBJECT_ID('dbo.patient_clinical_note_revisions','U') IS NULL
+CREATE TABLE dbo.patient_clinical_note_revisions (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_clinical_note_revisions PRIMARY KEY,
+    note_id INT NOT NULL CONSTRAINT FK_patient_note_revision_note REFERENCES dbo.patient_clinical_notes(id),
+    revision_number INT NOT NULL, note_text NVARCHAR(MAX) NOT NULL, changed_by VARCHAR(255) NOT NULL,
+    change_reason NVARCHAR(1000) NULL, created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_note_revision_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT UQ_patient_note_revision UNIQUE(note_id,revision_number)
+);
+GO
+
+IF OBJECT_ID('dbo.patient_documents','U') IS NULL
+CREATE TABLE dbo.patient_documents (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_documents PRIMARY KEY,
+    patient_id INT NOT NULL CONSTRAINT FK_patient_document_patient REFERENCES dbo.patients(id),
+    case_id INT NULL CONSTRAINT FK_patient_document_case REFERENCES dbo.cases(id),
+    document_type VARCHAR(80) NOT NULL, original_filename NVARCHAR(512) NOT NULL,
+    stored_filename VARCHAR(512) NOT NULL CONSTRAINT UQ_patient_document_stored UNIQUE,
+    content_type VARCHAR(120) NOT NULL, file_size BIGINT NOT NULL, checksum_sha256 VARCHAR(64) NOT NULL,
+    description NVARCHAR(1000) NULL, uploaded_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_document_created DEFAULT (SYSUTCDATETIME()), archived_at DATETIME2 NULL
+);
+GO
+
+IF OBJECT_ID('dbo.patient_imports','U') IS NULL
+CREATE TABLE dbo.patient_imports (
+    id INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patient_imports PRIMARY KEY,
+    patient_id INT NULL CONSTRAINT FK_patient_import_patient REFERENCES dbo.patients(id),
+    schema_version VARCHAR(20) NOT NULL, source_identifier VARCHAR(255) NULL, payload_hash VARCHAR(64) NOT NULL,
+    status VARCHAR(30) NOT NULL, summary_json NVARCHAR(MAX) NOT NULL, imported_by VARCHAR(255) NOT NULL,
+    created_at DATETIME2 NOT NULL CONSTRAINT DF_patient_import_created DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT CK_patient_import_summary_json CHECK (ISJSON(summary_json)=1)
+);
+GO
+
 /* Query indexes used by the API. */
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ai_analyses_slide_id' AND object_id=OBJECT_ID('dbo.ai_analyses')) CREATE INDEX idx_ai_analyses_slide_id ON dbo.ai_analyses(slide_id, id DESC);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_ai_analyses_case_id' AND object_id=OBJECT_ID('dbo.ai_analyses')) CREATE INDEX idx_ai_analyses_case_id ON dbo.ai_analyses(case_id, id DESC);
@@ -607,4 +770,10 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_viewer_preferences_user
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_annotation_revisions_annotation' AND object_id=OBJECT_ID('dbo.annotation_revisions')) CREATE INDEX idx_annotation_revisions_annotation ON dbo.annotation_revisions(annotation_id,revision_number DESC);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_report_reviews_report' AND object_id=OBJECT_ID('dbo.report_reviews')) CREATE INDEX idx_report_reviews_report ON dbo.report_reviews(report_id,id);
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_consultations_case' AND object_id=OBJECT_ID('dbo.case_consultations')) CREATE INDEX idx_consultations_case ON dbo.case_consultations(case_id,status);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_patient_identity_patient' AND object_id=OBJECT_ID('dbo.patient_identity_mappings')) CREATE INDEX idx_patient_identity_patient ON dbo.patient_identity_mappings(patient_id,id);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_patient_encounters_timeline' AND object_id=OBJECT_ID('dbo.patient_encounters')) CREATE INDEX idx_patient_encounters_timeline ON dbo.patient_encounters(patient_id,occurred_at DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_patient_tests_history' AND object_id=OBJECT_ID('dbo.patient_tests')) CREATE INDEX idx_patient_tests_history ON dbo.patient_tests(patient_id,order_date DESC,id DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_patient_notes_history' AND object_id=OBJECT_ID('dbo.patient_clinical_notes')) CREATE INDEX idx_patient_notes_history ON dbo.patient_clinical_notes(patient_id,created_at DESC,id DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_patient_documents' AND object_id=OBJECT_ID('dbo.patient_documents')) CREATE INDEX idx_patient_documents ON dbo.patient_documents(patient_id,created_at DESC);
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_accessions_patient' AND object_id=OBJECT_ID('dbo.accessions')) CREATE INDEX idx_accessions_patient ON dbo.accessions(patient_id,case_id);
 GO

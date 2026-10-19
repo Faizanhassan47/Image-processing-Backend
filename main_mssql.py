@@ -156,7 +156,6 @@ def init_db():
     with closing(connect()) as db:
         db.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
-IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
 CREATE TABLE users (
                 id INT IDENTITY(1,1) PRIMARY KEY,
                 username VARCHAR(255) UNIQUE NOT NULL,

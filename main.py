@@ -175,14 +175,7 @@ CREATE TABLE users (
                 db.execute("ALTER TABLE users DROP COLUMN password")
             except pyodbc.Error:
                 pass
-        # Migrate the original four-role prototype to the PRS role catalogue.
-        # This is intentionally idempotent so existing installations retain users.
-        db.execute("UPDATE users SET role = 'System Administrator' WHERE role = 'Admin'")
-        db.execute("UPDATE users SET role = 'Histotechnologist' WHERE role = 'Technician'")
-        db.execute("UPDATE users SET role = 'Auditor' WHERE role = 'Viewer'")
         db.execute("UPDATE users SET username = 'ETDadmin' WHERE LOWER(username) = 'eidadmin' AND NOT EXISTS (SELECT 1 FROM users WHERE LOWER(username) = 'etdadmin')")
-        db.execute("UPDATE users SET role = 'Super Administrator' WHERE LOWER(username) IN ('etddev', 'etdadmin')")
-        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_users_super_admin_reserved') ALTER TABLE users ADD CONSTRAINT CK_users_super_admin_reserved CHECK (role <> 'Super Administrator' OR LOWER(username) IN ('etddev','etdadmin'))")
             
         db.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='cases' and xtype='U')
@@ -379,6 +372,16 @@ CREATE TABLE audit_log (
         db.execute("IF COL_LENGTH('audit_log','device_location') IS NULL ALTER TABLE audit_log ADD device_location VARCHAR(255) NULL")
         db.execute("IF COL_LENGTH('audit_log','user_agent') IS NULL ALTER TABLE audit_log ADD user_agent VARCHAR(1000) NULL")
         db.execute("IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name='idx_audit_log_created_at' AND object_id = OBJECT_ID('audit_log')) CREATE INDEX idx_audit_log_created_at ON audit_log(created_at DESC)")
+        db.execute("""INSERT INTO audit_log (actor_username,action,target_type,target_id,details)
+            SELECT 'system','user.role_migration','user',CAST(id AS VARCHAR(50)),'previous_role=' + CAST(role AS VARCHAR(255)) + '; account_disabled_pending_reassignment'
+            FROM users u WHERE role IN ('Technician','Histotechnologist','Viewer','Auditor','AI Analyst','Integration Engineer')
+            AND NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.action='user.role_migration' AND a.target_type='user' AND a.target_id=CAST(u.id AS VARCHAR(50)))""")
+        db.execute("IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_users_approved_roles') ALTER TABLE users DROP CONSTRAINT CK_users_approved_roles")
+        db.execute("IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_users_super_admin_reserved') ALTER TABLE users DROP CONSTRAINT CK_users_super_admin_reserved")
+        db.execute("UPDATE users SET role='Laboratory Manager', is_active=0 WHERE role IN ('Technician','Histotechnologist','Viewer','Auditor','AI Analyst','Integration Engineer')")
+        db.execute("UPDATE users SET role='System Administrator' WHERE role='Admin'")
+        db.execute("UPDATE users SET role='System Administrator', is_active=1 WHERE LOWER(username) IN ('etddev','etdadmin')")
+        db.execute("ALTER TABLE users ADD CONSTRAINT CK_users_approved_roles CHECK (role IN ('System Administrator','Laboratory Manager','Pathologist'))")
 
         db.execute("""IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')
 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')
@@ -584,8 +587,8 @@ async def request_observability(request: Request, call_next):
 
 SECRET_KEY = os.environ["JWT_SECRET_KEY"]
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
-PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "4"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
+PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 COOKIE_SECURE = env_bool("COOKIE_SECURE", False)
 CSRF_PROTECTION_ENABLED = env_bool("CSRF_PROTECTION_ENABLED", True)
 LOGIN_RATE_LIMIT = int(os.getenv("LOGIN_RATE_LIMIT", "5"))
@@ -601,8 +604,14 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 def validate_password(password: str):
-    if len(password or "") < PASSWORD_MIN_LENGTH:
+    pwd = password or ""
+    if len(pwd) < PASSWORD_MIN_LENGTH:
         raise HTTPException(status_code=400, detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
+    if env_bool("REQUIRE_PASSWORD_COMPLEXITY", True):
+        has_letter = any(ch.isalpha() for ch in pwd)
+        has_digit = any(ch.isdigit() for ch in pwd)
+        if not (has_letter and has_digit):
+            raise HTTPException(status_code=400, detail="Password must contain both letters and numbers")
 
 def audit(db, actor: str, action: str, target_type: str, target_id="", details=""):
     metadata = get_audit_context()
@@ -644,15 +653,13 @@ def get_current_user(request: Request):
 
 def require_roles(allowed_roles: list[str]):
     def role_checker(current_user: dict = Depends(get_current_user)):
-        # Legacy route groups remain readable while authorization is evaluated
-        # against the canonical PRS roles.
         expanded_roles = set(allowed_roles)
         if "Admin" in expanded_roles:
             expanded_roles.add("System Administrator")
         if "Technician" in expanded_roles:
-            expanded_roles.add("Histotechnologist")
+            expanded_roles.add("Laboratory Manager")
         if "Viewer" in expanded_roles:
-            expanded_roles.update({"Auditor", "Laboratory Manager", "AI Analyst"})
+            expanded_roles.update({"Laboratory Manager", "Pathologist"})
         if current_user["role"] not in expanded_roles and current_user["role"] not in {"System Administrator", "Super Administrator"}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
         return current_user
@@ -668,10 +675,6 @@ USER_ROLES = {
     "System Administrator",
     "Laboratory Manager",
     "Pathologist",
-    "Histotechnologist",
-    "AI Analyst",
-    "Integration Engineer",
-    "Auditor",
 }
 ASSIGNABLE_USER_ROLES = USER_ROLES
 PROTECTED_SUPER_ADMINS = {"etddev", "etdadmin"}
@@ -706,7 +709,7 @@ def delete_user(user_id: int, current_user: dict = Depends(require_roles(["Syste
 @app.post("/api/users")
 def create_user(user: UserCreate, current_user: dict = Depends(require_roles(["System Administrator"]))):
     if is_protected_super_admin(user.username):
-        raise HTTPException(status_code=403, detail="Reserved Super Administrator usernames cannot be created through user management")
+        raise HTTPException(status_code=403, detail="Reserved protected-administrator usernames cannot be created through user management")
     if user.role not in ASSIGNABLE_USER_ROLES:
         raise HTTPException(status_code=400, detail="Invalid or protected role")
     validate_password(user.password)
@@ -848,6 +851,14 @@ def get_case(case_pk: int):
         raise HTTPException(404, "Case not found")
     return row
 
+def require_assigned_case(case, current_user: dict):
+    if current_user["role"] != "Pathologist":
+        return
+    assigned = (case["reviewer"] or "").strip().casefold()
+    identities = {(current_user.get("username") or "").strip().casefold(), (current_user.get("display_name") or "").strip().casefold()}
+    if not assigned or assigned not in identities:
+        raise HTTPException(status_code=403, detail="Pathologists may access only cases assigned to them")
+
 
 def get_slide(slide_id: int):
     with closing(connect()) as db:
@@ -941,9 +952,13 @@ def list_cases(
     status_filter: str | None = Query(None, alias="status"),
     reviewer: str | None = Query(None),
     search: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
 ):
     clauses = []
     params = []
+    if current_user["role"] == "Pathologist":
+        clauses.append("(LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?) OR LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?))")
+        params.extend([current_user["username"], current_user["display_name"]])
     if status_filter:
         if status_filter not in {"New", "In Review", "Reviewed"}:
             raise HTTPException(400, "Status must be New, In Review, or Reviewed")
@@ -954,7 +969,7 @@ def list_cases(
         if reviewer.strip() == "":
             clauses.append("reviewer = ''")
         else:
-            clauses.append("LOWER(reviewer) = LOWER(?)")
+            clauses.append("LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?)")
             params.append(reviewer.strip())
             
     if search and search.strip():
@@ -969,8 +984,10 @@ def list_cases(
 
 
 @app.get("/api/cases/{case_pk}", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
-def case_detail(case_pk: int):
-    return serialize_case(get_case(case_pk))
+def case_detail(case_pk: int, current_user: dict = Depends(get_current_user)):
+    case = get_case(case_pk)
+    require_assigned_case(case, current_user)
+    return serialize_case(case)
 
 
 class ReviewerChange(BaseModel):
@@ -1005,7 +1022,7 @@ def _append_history(db, case_pk, change_type, previous, new, actor):
         VALUES (?, ?, ?, ?, ?)""", (case_pk, change_type, previous, new, actor))
 
 
-@app.patch("/api/cases/{case_pk}/reviewer", dependencies=[Depends(require_roles(["Admin", "Pathologist", "Laboratory Manager"]))])
+@app.patch("/api/cases/{case_pk}/reviewer", dependencies=[Depends(require_roles(["System Administrator", "Laboratory Manager"]))])
 def assign_reviewer(case_pk: int, change: ReviewerChange, current_user: dict = Depends(get_current_user)):
     case = get_case(case_pk)
     actor = current_user["display_name"]
@@ -1021,7 +1038,7 @@ def assign_reviewer(case_pk: int, change: ReviewerChange, current_user: dict = D
 
 
 
-@app.post("/api/slides/{slide_pk}/qc", status_code=200, dependencies=[Depends(require_roles(["Admin", "Technician"]))])
+@app.post("/api/slides/{slide_pk}/qc", status_code=200, dependencies=[Depends(require_roles(["System Administrator", "Laboratory Manager", "Pathologist"]))])
 def add_slide_qc(slide_pk: int, qc: SlideQcUpdate, current_user: dict = Depends(get_current_user)):
     get_slide(slide_pk)
     actor = current_user["display_name"]
@@ -1050,6 +1067,7 @@ def add_slide_qc(slide_pk: int, qc: SlideQcUpdate, current_user: dict = Depends(
 @app.patch("/api/cases/{case_pk}/status", dependencies=[Depends(require_roles(["Admin", "Pathologist", "Technician", "Laboratory Manager"]))])
 def change_case_status(case_pk: int, change: StatusChange, current_user: dict = Depends(get_current_user)):
     case = get_case(case_pk)
+    require_assigned_case(case, current_user)
     actor = current_user["display_name"]
     new_status = change.status.strip()
     valid_statuses = {"New", "In Review", "Reviewed"}
@@ -1071,8 +1089,8 @@ def change_case_status(case_pk: int, change: StatusChange, current_user: dict = 
 
 
 @app.get("/api/cases/{case_pk}/review-notes", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
-def list_review_notes(case_pk: int):
-    get_case(case_pk)
+def list_review_notes(case_pk: int, current_user: dict = Depends(get_current_user)):
+    require_assigned_case(get_case(case_pk), current_user)
     with closing(connect()) as db:
         rows = db.execute(
             "SELECT * FROM case_review_notes WHERE case_id = ? ORDER BY id DESC", (case_pk,)
@@ -1082,7 +1100,7 @@ def list_review_notes(case_pk: int):
 
 @app.post("/api/cases/{case_pk}/review-notes", status_code=201, dependencies=[Depends(require_roles(["Admin", "Pathologist"]))])
 def add_review_note(case_pk: int, review_note: ReviewNoteCreate, current_user: dict = Depends(get_current_user)):
-    get_case(case_pk)
+    require_assigned_case(get_case(case_pk), current_user)
     author = current_user["display_name"]
     note = _nonblank(review_note.note, "Review note")
     with closing(connect()) as db:
@@ -1096,8 +1114,8 @@ def add_review_note(case_pk: int, review_note: ReviewNoteCreate, current_user: d
 
 
 @app.get("/api/cases/{case_pk}/review-history", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
-def list_review_history(case_pk: int):
-    get_case(case_pk)
+def list_review_history(case_pk: int, current_user: dict = Depends(get_current_user)):
+    require_assigned_case(get_case(case_pk), current_user)
     with closing(connect()) as db:
         rows = db.execute(
             "SELECT * FROM case_review_history WHERE case_id = ? ORDER BY id DESC", (case_pk,)
@@ -1570,8 +1588,8 @@ def serialize_report(row):
     return report
 
 @app.get("/api/cases/{case_pk}/reports", dependencies=[Depends(require_roles(["Admin", "Technician", "Pathologist", "Viewer"]))])
-def list_reports(case_pk: int):
-    get_case(case_pk)
+def list_reports(case_pk: int, current_user: dict = Depends(get_current_user)):
+    require_assigned_case(get_case(case_pk), current_user)
     with closing(connect()) as db:
         rows = db.execute(
             "SELECT * FROM reports WHERE case_id = ? ORDER BY version DESC",
@@ -1581,7 +1599,7 @@ def list_reports(case_pk: int):
 
 @app.post("/api/cases/{case_pk}/reports", status_code=201, dependencies=[Depends(require_roles(["Admin", "Pathologist"]))])
 def create_draft_report(case_pk: int, current_user: dict = Depends(get_current_user)):
-    get_case(case_pk)
+    require_assigned_case(get_case(case_pk), current_user)
     with closing(connect()) as db:
         # Check if a draft already exists
         existing_draft = db.execute(
@@ -1637,6 +1655,7 @@ def update_report(report_id: int, update: ReportUpdate, current_user: dict = Dep
         report = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         if not report:
             raise HTTPException(404, "Report not found")
+        require_assigned_case(get_case(report["case_id"]), current_user)
         if report["status"] != "Draft":
             raise HTTPException(400, "Cannot edit a finalized report")
             
@@ -1670,11 +1689,12 @@ def update_report(report_id: int, update: ReportUpdate, current_user: dict = Dep
     return serialize_report(row)
 
 @app.post("/api/reports/{report_id}/finalize", dependencies=[Depends(require_roles(["Admin", "Pathologist"]))])
-def finalize_report(report_id: int):
+def finalize_report(report_id: int, current_user: dict = Depends(get_current_user)):
     with closing(connect()) as db:
         report = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         if not report:
             raise HTTPException(404, "Report not found")
+        require_assigned_case(get_case(report["case_id"]), current_user)
         if report["status"] == "Finalized":
             return serialize_report(report)
             
