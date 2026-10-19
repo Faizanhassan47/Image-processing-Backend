@@ -1783,14 +1783,14 @@ def export_report_html(report_id: int):
     return Response(document,media_type="text/html",headers={"Content-Disposition":f"attachment; filename=report_{case['case_id']}_v{report['version']}.html"})
 
 
-# Enterprise extension APIs are registered after the core dependencies exist to
-# avoid coupling their adapter contracts to FastAPI application construction.
-from platform_api import create_platform_router, init_platform_schema
-init_platform_schema(connect)
-app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS, openslide))
+# Centralized Services APIs (Patient Management & Platform Operations)
+from services.api import create_services_router, init_services_schemas
+init_services_schemas(connect)
+app.include_router(create_services_router(connect, require_roles, get_current_user, audit, UPLOADS, openslide))
 
 # HoVer-Net AI Analysis API
 from ai_engine import init_ai_schema
 from ai_api import create_ai_router
 init_ai_schema(connect)
 app.include_router(create_ai_router(connect, require_roles, get_current_user, get_slide, get_case, _stored_path))
+
