@@ -831,6 +831,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             db.execute('UPDATE annotations SET source_ai_result_id=NULL WHERE source_ai_result_id IN (SELECT r.id FROM ai_results r JOIN ai_jobs j ON j.id=r.ai_job_id WHERE j.slide_id=?)',(slide_id,))
             db.execute('DELETE FROM ai_results WHERE ai_job_id IN (SELECT id FROM ai_jobs WHERE slide_id=?)',(slide_id,))
             db.execute('DELETE FROM ai_jobs WHERE slide_id=?',(slide_id,))
+            try: db.execute('DELETE FROM ai_analyses WHERE slide_id=?',(slide_id,))
+            except Exception: pass
             if version_ids:
                 placeholders=','.join('?' for _ in version_ids)
                 db.execute(f'UPDATE annotations SET image_version_id=NULL WHERE image_version_id IN ({placeholders})',tuple(version_ids))
@@ -878,6 +880,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 db.execute(f'UPDATE annotations SET source_ai_result_id=NULL WHERE source_ai_result_id IN (SELECT r.id FROM ai_results r JOIN ai_jobs j ON j.id=r.ai_job_id WHERE j.slide_id IN ({slide_marks}))',tuple(slide_ids))
                 db.execute(f'DELETE FROM ai_results WHERE ai_job_id IN (SELECT id FROM ai_jobs WHERE slide_id IN ({slide_marks}))',tuple(slide_ids))
                 db.execute(f'DELETE FROM ai_jobs WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
+                try: db.execute(f'DELETE FROM ai_analyses WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
+                except Exception: pass
                 if version_ids:
                     version_marks=','.join('?' for _ in version_ids)
                     db.execute(f'UPDATE annotations SET image_version_id=NULL WHERE image_version_id IN ({version_marks})',tuple(version_ids))
@@ -887,6 +891,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 db.execute(f'DELETE FROM slide_qc_history WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM image_versions WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM slides WHERE id IN ({slide_marks})',tuple(slide_ids))
+            try: db.execute('DELETE FROM ai_analyses WHERE case_id=?',(case_id,))
+            except Exception: pass
             db.execute('DELETE FROM report_findings WHERE report_id IN (SELECT id FROM reports WHERE case_id=?)',(case_id,))
             db.execute('DELETE FROM report_reviews WHERE report_id IN (SELECT id FROM reports WHERE case_id=?)',(case_id,))
             db.execute('DELETE FROM reports WHERE case_id=?',(case_id,))

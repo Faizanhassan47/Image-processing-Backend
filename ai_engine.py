@@ -15,11 +15,13 @@ import logging
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import statistics
 import subprocess
 import threading
+import time
 import uuid
 
 import cv2
@@ -116,6 +118,76 @@ GALLERY_PADDING = 16
 
 
 # ============================================================
+# ROI VALIDATION & PATCH CALCULATION
+# ============================================================
+
+TQDM_PROGRESS_RE = re.compile(
+    r"Process Patches:\s*(\d+)%\|.*?\|\s*(\d+)/(\d+)\s*\[([0-9:]+)<([0-9:?]+)"
+)
+
+
+def calculate_hovernet_patches(
+    width: int,
+    height: int,
+    patch_input_shape: int = 256,
+    patch_output_shape: int = 164,
+) -> dict:
+    """Calculate the exact number of patches HoVer-Net will extract for an ROI.
+    
+    Uses HoVer-Net's exact tiling formula (_prepare_patching in tile.py).
+    """
+    step_size = patch_output_shape
+    nr_step_h = math.ceil((height - step_size) / step_size) + 1 if height > step_size else 1
+    nr_step_w = math.ceil((width - step_size) / step_size) + 1 if width > step_size else 1
+    total_patches = max(1, nr_step_h * nr_step_w)
+    tqdm_total = total_patches + 1
+    seconds_per_patch = float(os.getenv("HOVERNET_SECONDS_PER_PATCH", "3.5"))
+    est_seconds = total_patches * seconds_per_patch
+    return {
+        "width": width,
+        "height": height,
+        "nr_step_h": nr_step_h,
+        "nr_step_w": nr_step_w,
+        "total_patches": total_patches,
+        "tqdm_total": tqdm_total,
+        "estimated_seconds": round(est_seconds, 1),
+    }
+
+
+def validate_roi_dimensions(
+    width: int | None,
+    height: int | None,
+    slide_width: int,
+    slide_height: int,
+    x: int | None = None,
+    y: int | None = None,
+    min_dim: int = 32,
+    max_dim: int | None = None,
+) -> tuple[bool, str | None]:
+    """Validate ROI pixel dimensions and boundaries before attempting inference."""
+    if width is None or height is None:
+        return False, "ROI width and height must be specified."
+    if width < min_dim or height < min_dim:
+        return False, f"ROI dimensions ({width}×{height}) are too small. Minimum supported size is {min_dim}×{min_dim} pixels."
+
+    if max_dim is None:
+        max_dim = int(os.getenv("HOVERNET_MAX_ROI_DIM", "8192"))
+    if width > max_dim or height > max_dim:
+        return False, f"ROI dimensions ({width}×{height}) exceed maximum allowed dimension of {max_dim}×{max_dim} pixels."
+
+    if width > slide_width or height > slide_height:
+        return False, f"ROI dimensions ({width}×{height}) exceed slide level-0 dimensions ({slide_width}×{slide_height})."
+
+    if x is not None and y is not None:
+        if x < 0 or y < 0:
+            return False, f"ROI coordinates ({x}, {y}) cannot be negative."
+        if x + width > slide_width or y + height > slide_height:
+            return False, f"ROI region ({x}, {y}, {width}, {height}) extends beyond slide boundaries ({slide_width}×{slide_height})."
+
+    return True, None
+
+
+# ============================================================
 # PERSISTENT HOVER-NET WORKER MANAGER
 # ============================================================
 
@@ -132,10 +204,24 @@ class HoverNetWorkerManager:
                 cls._instance._process = None
                 cls._instance._worker_lock = threading.Lock()
                 cls._instance._start_lock = threading.Lock()
+                cls._instance._stdout_queue = queue.Queue()
+                cls._instance._ready_event = threading.Event()
+                cls._instance._last_error = None
+                cls._instance._progress_callback = None
+                cls._instance._cancel_event = threading.Event()
+                cls._instance._last_activity_time = time.time()
             return cls._instance
 
     def is_running(self) -> bool:
         return self._process is not None and self._process.poll() is None
+
+    def cancel_inference(self):
+        """Request immediate cancellation of active inference."""
+        self._cancel_event.set()
+        logger.info("Cancellation requested for active HoVer-Net inference worker.")
+        self.stop_worker()
+        # Start a fresh worker in background so it is ready for subsequent jobs
+        threading.Thread(target=self.start_worker, daemon=True, name="HoVerNet-Recovery").start()
 
     def start_worker(self, timeout_seconds: int = 90):
         with self._start_lock:
@@ -151,6 +237,17 @@ class HoverNetWorkerManager:
 
             logger.info("Starting HoVer-Net persistent worker (%s)...", HOVERNET_WORKER)
 
+            # Clear queue and event
+            while not self._stdout_queue.empty():
+                try:
+                    self._stdout_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._ready_event.clear()
+            self._cancel_event.clear()
+            self._last_error = None
+            self._last_activity_time = time.time()
+
             self._process = subprocess.Popen(
                 [str(HOVERNET_PYTHON), str(HOVERNET_WORKER)],
                 cwd=str(HOVERNET_WORKDIR),
@@ -163,34 +260,92 @@ class HoverNetWorkerManager:
                 bufsize=1,
             )
 
-            # Wait for READY signal on stderr (hovernet_worker outputs READY to stderr)
-            ready = False
-            start_time = datetime.now()
+            # Continuous stderr drainer to eliminate pipe deadlocks and parse real-time tqdm progress
+            def drain_stderr(proc):
+                try:
+                    for line in iter(proc.stderr.readline, ""):
+                        if not line:
+                            break
+                        self._last_activity_time = time.time()
+                        line_str = line.strip()
+                        if line_str:
+                            logger.info("[HoVer-Net Worker stderr] %s", line_str)
+                            if line_str == "READY":
+                                self._ready_event.set()
+                            elif line_str.startswith("ERROR:"):
+                                self._last_error = line_str
 
-            while not ready:
-                line = self._process.stderr.readline()
-                if not line:
-                    code = self._process.poll()
-                    raise RuntimeError(f"HoVer-Net worker process exited prematurely with code {code}")
-                line_str = line.strip()
-                if line_str:
-                    logger.info("[HoVer-Net Worker] %s", line_str)
-                if line_str == "READY":
-                    ready = True
-                    break
-                if (datetime.now() - start_time).total_seconds() > timeout_seconds:
-                    self.stop_worker()
-                    raise TimeoutError("HoVer-Net worker timed out waiting for READY state")
+                            # Parse progress lines (which may contain \r)
+                            for chunk in line.split("\r"):
+                                c = chunk.strip()
+                                if not c:
+                                    continue
+                                m = TQDM_PROGRESS_RE.search(c)
+                                if m:
+                                    pct, curr, tot, elap, rem = m.groups()
+                                    cb = self._progress_callback
+                                    if cb:
+                                        try:
+                                            cb({
+                                                "percent": int(pct),
+                                                "processed_patches": int(curr),
+                                                "total_patches": int(tot),
+                                                "elapsed_str": elap,
+                                                "remaining_str": rem if rem != "?" else None,
+                                            })
+                                        except Exception:
+                                            pass
+                except Exception as exc:
+                    logger.debug("Stderr drainer ended: %s", exc)
+
+            # Continuous stdout queue reader
+            def drain_stdout(proc, q):
+                try:
+                    for line in iter(proc.stdout.readline, ""):
+                        if not line:
+                            break
+                        q.put(line)
+                except Exception as exc:
+                    logger.debug("Stdout reader ended: %s", exc)
+
+            t_err = threading.Thread(target=drain_stderr, args=(self._process,), daemon=True, name="HoVerNet-Stderr-Drainer")
+            t_err.start()
+
+            t_out = threading.Thread(target=drain_stdout, args=(self._process, self._stdout_queue), daemon=True, name="HoVerNet-Stdout-Reader")
+            t_out.start()
+
+            # Wait for READY signal
+            if not self._ready_event.wait(timeout=timeout_seconds):
+                code = self._process.poll()
+                self.stop_worker()
+                raise TimeoutError(f"HoVer-Net worker timed out waiting for READY state (exit code: {code}, error: {self._last_error})")
 
             logger.info("HoVer-Net persistent worker is READY.")
 
-    def run_inference(self, image_path: Path, timeout_seconds: int = 180) -> dict:
-        """Send an image path to the worker and read the resulting JSON."""
+    def run_inference(
+        self,
+        image_path: Path,
+        timeout_seconds: int | None = None,
+        expected_patches: int | None = None,
+        progress_callback: object = None,
+        cancel_event: threading.Event | None = None,
+    ) -> dict:
+        """Send an image path to the worker and read the resulting JSON with dynamic timeout and watchdog."""
         image_path = Path(image_path).resolve()
         if not image_path.is_file():
             raise FileNotFoundError(f"Inference input image does not exist: {image_path}")
 
+        # Compute dynamic execution timeout appropriate for the ROI size
+        base_timeout = int(os.getenv("HOVERNET_BASE_TIMEOUT", "180"))
+        sec_per_patch = float(os.getenv("HOVERNET_SECONDS_PER_PATCH", "3.5"))
+        inactivity_timeout = int(os.getenv("HOVERNET_INACTIVITY_TIMEOUT", "180"))
+        if timeout_seconds is None:
+            patches = expected_patches or 16
+            timeout_seconds = max(base_timeout, int(patches * sec_per_patch) + 300)
+
         with self._worker_lock:
+            self._cancel_event.clear()
+            self._progress_callback = progress_callback
             self.start_worker()
 
             payload = json.dumps({"image_path": str(image_path)}) + "\n"
@@ -200,39 +355,76 @@ class HoverNetWorkerManager:
                     self._process.stdin.write(payload)
                     self._process.stdin.flush()
                 except (BrokenPipeError, OSError) as exc:
-                    logger.warning("Worker pipe broken (%s). Restarting...", exc)
-                    self._process = None
+                    logger.warning("Worker pipe broken (%s). Restarting worker...", exc)
+                    self.stop_worker()
                     self.start_worker()
                     self._process.stdin.write(payload)
                     self._process.stdin.flush()
 
             send_request()
+            self._last_activity_time = time.time()
+            deadline = time.time() + timeout_seconds
 
-            # Read response from stdout
-            while True:
-                line = self._process.stdout.readline()
-                if not line:
-                    code = self._process.poll()
-                    raise RuntimeError(f"HoVer-Net worker stopped unexpectedly with exit code {code}")
+            try:
+                while True:
+                    # 1. Check for cancellation
+                    if (cancel_event and cancel_event.is_set()) or self._cancel_event.is_set():
+                        logger.info("HoVer-Net inference was cancelled. Halting worker.")
+                        self.stop_worker()
+                        self.start_worker()
+                        raise InterruptedError("HoVer-Net inference was cancelled by user.")
 
-                line_str = line.strip()
-                if not line_str:
-                    continue
+                    now = time.time()
 
-                try:
-                    response = json.loads(line_str)
-                except json.JSONDecodeError:
-                    logger.debug("[HoVer-Net Non-JSON stdout] %s", line_str)
-                    continue
+                    # 2. Inactivity / Stalled Watchdog
+                    if now - self._last_activity_time > inactivity_timeout:
+                        logger.error(
+                            "HoVer-Net inference stalled with no progress for %d seconds. Terminating worker.",
+                            inactivity_timeout,
+                        )
+                        self.stop_worker()
+                        self.start_worker()
+                        raise TimeoutError(f"HoVer-Net inference stalled with no progress for {inactivity_timeout} seconds.")
 
-                if not isinstance(response, dict):
-                    continue
+                    # 3. Overall execution deadline
+                    if now >= deadline:
+                        logger.error("HoVer-Net inference exceeded maximum execution limit of %d seconds.", timeout_seconds)
+                        self.stop_worker()
+                        self.start_worker()
+                        raise TimeoutError(f"HoVer-Net inference exceeded maximum execution limit of {timeout_seconds} seconds.")
 
-                if "error" in response:
-                    raise RuntimeError(f"HoVer-Net worker returned error: {response['error']}")
+                    # 4. Wait for stdout output
+                    try:
+                        line = self._stdout_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        if self._process.poll() is not None:
+                            code = self._process.poll()
+                            self.stop_worker()
+                            self.start_worker()
+                            raise RuntimeError(f"HoVer-Net worker died unexpectedly (exit code {code}, error: {self._last_error})")
+                        continue
 
-                if isinstance(response.get("nuc"), dict) or "nuc" in response:
-                    return response
+                    self._last_activity_time = time.time()
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+
+                    try:
+                        response = json.loads(line_str)
+                    except json.JSONDecodeError:
+                        logger.debug("[HoVer-Net Non-JSON stdout] %s", line_str)
+                        continue
+
+                    if not isinstance(response, dict):
+                        continue
+
+                    if "error" in response:
+                        raise RuntimeError(f"HoVer-Net worker returned error: {response['error']}")
+
+                    if isinstance(response.get("nuc"), dict) or "nuc" in response:
+                        return response
+            finally:
+                self._progress_callback = None
 
     def stop_worker(self):
         with self._start_lock:
@@ -240,7 +432,7 @@ class HoverNetWorkerManager:
                 try:
                     logger.info("Stopping HoVer-Net worker...")
                     self._process.terminate()
-                    self._process.wait(timeout=5)
+                    self._process.wait(timeout=3)
                 except Exception:
                     try:
                         self._process.kill()
@@ -252,6 +444,161 @@ class HoverNetWorkerManager:
 
 # Global worker manager instance
 hovernet_manager = HoverNetWorkerManager()
+
+
+# ============================================================
+# BACKGROUND JOB SYSTEM
+# ============================================================
+
+class AIJob:
+    """Represents a background or synchronous HoVer-Net analysis job with progress."""
+
+    def __init__(
+        self,
+        job_id: str,
+        slide_id: int,
+        case_id: int,
+        requested_by: str,
+        roi_info: dict,
+        total_patches: int,
+        estimated_seconds: float,
+    ):
+        self.job_id = job_id
+        self.slide_id = slide_id
+        self.case_id = case_id
+        self.requested_by = requested_by
+        self.roi_info = roi_info
+        self.total_patches = total_patches
+        self.estimated_seconds = estimated_seconds
+        self.processed_patches = 0
+        self.percent = 0
+        self.elapsed_seconds = 0.0
+        self.elapsed_str = "00:00"
+        self.remaining_seconds = estimated_seconds
+        self.remaining_str = None
+        self.status = "pending"  # pending, processing, completed, failed, cancelled, timeout
+        self.analysis_id = None
+        self.result = None
+        self.error = None
+        self.created_at = datetime.now(timezone.utc).isoformat()
+        self.started_at = None
+        self.completed_at = None
+        self.cancel_event = threading.Event()
+        self.start_time = None
+
+    def to_dict(self) -> dict:
+        curr_elapsed = self.elapsed_seconds
+        if self.status == "processing" and self.start_time:
+            curr_elapsed = time.time() - self.start_time
+            if not self.elapsed_str or self.elapsed_str == "00:00":
+                m = int(curr_elapsed // 60)
+                s = int(curr_elapsed % 60)
+                self.elapsed_str = f"{m:02d}:{s:02d}"
+
+        rem_sec = self.remaining_seconds
+        if self.status == "processing" and self.total_patches > 0:
+            if self.processed_patches > 0 and curr_elapsed > 0:
+                sec_per_patch = curr_elapsed / self.processed_patches
+                rem_sec = max(0.0, (self.total_patches - self.processed_patches) * sec_per_patch)
+            elif rem_sec is None and self.estimated_seconds:
+                rem_sec = max(0.0, self.estimated_seconds - curr_elapsed)
+
+        stage = "Ready"
+        if self.status == "processing":
+            if self.processed_patches > 0:
+                stage = f"Analyzing patch {self.processed_patches} of {self.total_patches}..."
+            else:
+                stage = "Running HoVer-Net inference..."
+        elif self.status == "completed":
+            stage = "Analysis complete"
+        elif self.status == "cancelled":
+            stage = "Cancelled"
+        elif self.status == "failed":
+            stage = "Failed"
+
+        progress_dict = {
+            "current": self.processed_patches,
+            "total": self.total_patches,
+            "percentage": self.percent,
+            "elapsed_seconds": round(curr_elapsed, 1),
+            "remaining_seconds": round(rem_sec, 1) if rem_sec is not None else None,
+            "stage": stage,
+        }
+
+        return {
+            "job_id": self.job_id,
+            "id": self.job_id,
+            "slide_id": self.slide_id,
+            "case_id": self.case_id,
+            "status": self.status,
+            "progress": progress_dict,
+            "processed_patches": self.processed_patches,
+            "total_patches": self.total_patches,
+            "percent": self.percent,
+            "elapsed_seconds": round(curr_elapsed, 1),
+            "elapsed_str": self.elapsed_str,
+            "remaining_seconds": round(rem_sec, 1) if rem_sec is not None else None,
+            "remaining_str": self.remaining_str,
+            "estimated_seconds": self.estimated_seconds,
+            "analysis_id": self.analysis_id,
+            "error": self.error,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "result": self.result,
+        }
+
+
+class AIJobManager:
+    """Manages active AI background jobs, progress monitoring and cancellations."""
+
+    def __init__(self):
+        self._jobs: dict[str, AIJob] = {}
+        self._lock = threading.Lock()
+
+    def create_job(
+        self,
+        slide_id: int,
+        case_id: int,
+        requested_by: str,
+        roi_info: dict,
+        total_patches: int,
+        estimated_seconds: float,
+    ) -> AIJob:
+        with self._lock:
+            job_id = f"job-{uuid.uuid4().hex[:12]}"
+            job = AIJob(
+                job_id=job_id,
+                slide_id=slide_id,
+                case_id=case_id,
+                requested_by=requested_by,
+                roi_info=roi_info,
+                total_patches=total_patches,
+                estimated_seconds=estimated_seconds,
+            )
+            self._jobs[job_id] = job
+            return job
+
+    def get_job(self, job_id: str) -> AIJob | None:
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def cancel_job(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if not job:
+                return False
+            if job.status in ("completed", "failed", "cancelled", "timeout"):
+                return False
+            job.status = "cancelled"
+            job.error = "Analysis cancelled by user."
+            job.completed_at = datetime.now(timezone.utc).isoformat()
+            job.cancel_event.set()
+            hovernet_manager.cancel_inference()
+            return True
+
+
+ai_job_manager = AIJobManager()
 
 
 # ============================================================
@@ -359,8 +706,9 @@ def extract_roi(
         downsample = float(slide.level_downsamples[level])
         level_w, level_h = slide.level_dimensions[level]
 
-        if x < 0 or y < 0 or x + width > level_w or y + height > level_h:
-            raise ValueError(f"Selected ROI [{x}, {y}, {width}, {height}] exceeds slide bounds [{level_w}, {level_h}].")
+        valid, err = validate_roi_dimensions(width, height, level_w, level_h, x, y)
+        if not valid:
+            raise ValueError(err)
 
         level0_x = int(round(x * downsample))
         level0_y = int(round(y * downsample))
@@ -514,6 +862,15 @@ def analyze_nuclei(nuclei: dict, mpp_x: float | None = None, mpp_y: float | None
                     "median_area_um2": round(float(np.median(um2_areas)), 2),
                 })
 
+        morph_summary.update({
+            "area_median": morph_summary.get("median_area_pixels"),
+            "area_mean": morph_summary.get("mean_area_pixels"),
+            "perimeter_median": morph_summary.get("mean_perimeter_pixels"),
+            "circularity_median": morph_summary.get("mean_circularity"),
+            "aspect_ratio_median": morph_summary.get("mean_aspect_ratio"),
+            "total_nuclei": total,
+        })
+
     spatial_bbox = None
     if spatial_x and spatial_y:
         spatial_bbox = {
@@ -523,10 +880,16 @@ def analyze_nuclei(nuclei: dict, mpp_x: float | None = None, mpp_y: float | None
             "max_y": round(max(spatial_y), 2),
         }
 
+    classification_breakdown = {
+        HOVERNET_TYPE_NAMES[tid]: type_counts[tid]
+        for tid in sorted(HOVERNET_TYPES.keys())
+    }
+
     return {
         "total_nuclei": total,
         "type_counts": type_counts,
         "type_summary": type_summary,
+        "classification_breakdown": classification_breakdown,
         "average_type_confidence": round(float(np.mean(scores)), 4) if scores else None,
         "morphology": morph_summary,
         "spatial_bbox": spatial_bbox,
@@ -535,6 +898,52 @@ def analyze_nuclei(nuclei: dict, mpp_x: float | None = None, mpp_y: float | None
             "percentage": round(type_counts[1] / total * 100.0 if total else 0.0, 2),
         },
     }
+
+
+def format_nucleus_predictions(
+    nuclei_dict: dict,
+    level0_x: int,
+    level0_y: int,
+    mpp_x: float | None = None,
+    mpp_y: float | None = None,
+) -> list[dict]:
+    """Formats nuclei into a list for frontend rendering, with level-0 slide coordinates."""
+    formatted = []
+    for nid, nuc in (nuclei_dict or {}).items():
+        if not isinstance(nuc, dict):
+            continue
+        tid = normalize_nucleus_type(nuc.get("type", 0))
+        tname = HOVERNET_TYPE_NAMES[tid]
+
+        contour_local = nuc.get("contour") or []
+        centroid_local = nuc.get("centroid") or [0, 0]
+
+        contour_slide = [[round(pt[0] + level0_x, 1), round(pt[1] + level0_y, 1)] for pt in contour_local]
+        centroid_slide = [round(centroid_local[0] + level0_x, 2), round(centroid_local[1] + level0_y, 2)]
+
+        cnt_np = get_nucleus_contour(nuc)
+        morph = calculate_nucleus_morphology(cnt_np, mpp_x, mpp_y) or {}
+
+        prob = nuc.get("type_prob")
+        type_prob = round(float(prob), 4) if (prob is not None and math.isfinite(float(prob))) else None
+
+        formatted.append({
+            "id": str(nid),
+            "type": tname,
+            "type_id": tid,
+            "type_prob": type_prob,
+            "centroid": centroid_slide,
+            "contour": contour_slide,
+            "roi_centroid": centroid_local,
+            "roi_contour": contour_local,
+            "area": morph.get("area_pixels"),
+            "area_um2": morph.get("area_um2"),
+            "perimeter": morph.get("perimeter_pixels"),
+            "circularity": morph.get("circularity"),
+            "aspect_ratio": morph.get("aspect_ratio"),
+            "color": TYPE_HEX_COLORS[tname],
+        })
+    return formatted
 
 
 def summarize_classification_scores(nuclei: dict, review_threshold: float = 0.70) -> dict:
@@ -1023,16 +1432,30 @@ def save_ai_analysis_record(
     with closing(connect_func()) as db:
         # Compact structured nucleus predictions (contours, centroids, types, genuine scores)
         compact_predictions = {}
+        roi_x = roi_info.get("x", 0)
+        roi_y = roi_info.get("y", 0)
+
         for nid, nuc in (nuclei_dict or {}).items():
             if isinstance(nuc, dict):
+                tid = normalize_nucleus_type(nuc.get("type", 0))
+                tname = HOVERNET_TYPE_NAMES[tid]
+                c_local = nuc.get("contour") or []
+                cnt_local = nuc.get("centroid") or [0, 0]
+                c_slide = [[round(pt[0] + roi_x, 1), round(pt[1] + roi_y, 1)] for pt in c_local]
+                cnt_slide = [round(cnt_local[0] + roi_x, 2), round(cnt_local[1] + roi_y, 2)]
+
                 compact_predictions[str(nid)] = {
                     "id": str(nid),
-                    "type": normalize_nucleus_type(nuc.get("type", 0)),
-                    "type_name": HOVERNET_TYPE_NAMES[normalize_nucleus_type(nuc.get("type", 0))],
+                    "type": tname,
+                    "type_id": tid,
+                    "type_name": tname,
                     "type_prob": round(float(nuc["type_prob"]), 4) if nuc.get("type_prob") is not None else None,
-                    "centroid": [round(float(c), 2) for c in nuc.get("centroid", [])],
-                    "contour": nuc.get("contour"),
+                    "centroid": cnt_slide,
+                    "contour": c_slide,
+                    "roi_centroid": cnt_local,
+                    "roi_contour": c_local,
                     "box": nuc.get("box"),
+                    "color": TYPE_HEX_COLORS[tname],
                 }
 
         type_counts = analysis_data.get("type_counts", {})
@@ -1040,6 +1463,7 @@ def save_ai_analysis_record(
             "morphology": analysis_data.get("morphology"),
             "confidence_statistics": score_stats,
             "type_summary": analysis_data.get("type_summary"),
+            "classification_breakdown": analysis_data.get("classification_breakdown"),
             "nuclear_density_per_mm2": analysis_data.get("nuclear_density_per_mm2"),
             "spatial_bbox": analysis_data.get("spatial_bbox"),
         }
