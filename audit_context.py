@@ -1,7 +1,5 @@
-from contextvars import ContextVar
+"""Re-export audit context functions from core.audit_context."""
+from core.audit_context import get_audit_context, reset_audit_context, set_audit_context
 
-_metadata = ContextVar("audit_request_metadata", default={})
+__all__ = ["get_audit_context", "reset_audit_context", "set_audit_context"]
 
-def set_audit_context(value): return _metadata.set(value)
-def reset_audit_context(token): _metadata.reset(token)
-def get_audit_context(): return _metadata.get()

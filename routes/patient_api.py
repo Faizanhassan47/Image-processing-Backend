@@ -15,13 +15,17 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, field_validator
 
 
+from core import (
+    ADMIN_ROLES,
+    CLINICAL_WRITE_ROLES,
+    EXPORT_ROLES,
+    READ_ROLES,
+    WRITE_ROLES,
+)
+
 PATIENT_SCHEMA_VERSION = "1.0"
-READ_ROLES = ["System Administrator", "Laboratory Manager", "Pathologist"]
-WRITE_ROLES = ["System Administrator", "Laboratory Manager"]
-CLINICAL_WRITE_ROLES = ["System Administrator", "Laboratory Manager"]
-EXPORT_ROLES = READ_ROLES
-ADMIN_ROLES = ["System Administrator", "Super Administrator"]
 DOCUMENT_TYPES = {"application/pdf": ".pdf", "image/jpeg": ".jpg", "image/png": ".png", "text/plain": ".txt"}
+
 
 
 CNIC_PATTERN = re.compile(r"^\d{13}$")

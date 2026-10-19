@@ -1,6 +1,9 @@
 from .queries import *
+from .init_tables import init_db
 
 __all__ = [
+    "init_db",
+
     "GET_USER_BY_USERNAME",
     "GET_USER_BY_ID",
     "LIST_ALL_USERS",

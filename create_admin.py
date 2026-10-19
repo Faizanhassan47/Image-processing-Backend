@@ -28,12 +28,12 @@ def create_super_admins():
                 ).fetchone()
                 if existing:
                     db.execute(
-                        "UPDATE users SET username=?, display_name=?, role='Super Administrator', password_hash=?, is_active=1 WHERE id=?",
+                        "UPDATE users SET username=?, display_name=?, role='System Administrator', password_hash=?, is_active=1 WHERE id=?",
                         (username, display_name, password_hash, existing["id"]),
                     )
                 else:
                     db.execute(
-                        "INSERT INTO users (username, display_name, role, password_hash) VALUES (?, ?, 'Super Administrator', ?)",
+                        "INSERT INTO users (username, display_name, role, password_hash) VALUES (?, ?, 'System Administrator', ?)",
                         (username, display_name, password_hash),
                     )
             db.commit()

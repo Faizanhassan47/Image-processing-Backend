@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from ai_engine import (
+from services.ai_engine import (
     AI_GALLERY_DIR,
     AI_REPORT_DIR,
     AI_ROI_DIR,
@@ -62,11 +62,10 @@ class AIAnalysisRequest(BaseModel):
 
 
 def create_ai_router(connect_func, require_roles_func, get_current_user_func, get_slide_func, get_case_func, stored_path_func):
+    from core import AI_READ_ROLES as ai_read_roles, AI_RUN_ROLES as ai_run_roles
+
     router = APIRouter(tags=["AI Analysis"])
 
-    # Permitted roles for viewing/running AI
-    ai_run_roles = ["Admin", "Pathologist", "Technician", "AI Analyst"]
-    ai_read_roles = ["Admin", "Pathologist", "Technician", "Viewer", "AI Analyst"]
 
     def _get_analysis_row(db, analysis_id: int):
         row = db.execute("SELECT * FROM ai_analyses WHERE id = ?", (analysis_id,)).fetchone()

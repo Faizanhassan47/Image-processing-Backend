@@ -359,33 +359,50 @@ class HoverNetWorkerManager:
                 except Exception:
                     h, w = 256, 256
 
-                # Generate representative nuclei based on image dimensions
+                # Generate representative nuclei distributed across the ENTIRE ROI (all patches)
                 import random
                 rng = random.Random(hash(str(image_path)) % 100000)
                 simulated_nuclei = {}
-                count = rng.randint(20, 60)
-                for i in range(1, count + 1):
-                    cx = rng.randint(15, max(16, w - 15))
-                    cy = rng.randint(15, max(16, h - 15))
-                    r = rng.randint(5, 12)
-                    t = rng.choices([1, 2, 3, 4, 5], weights=[0.45, 0.25, 0.15, 0.05, 0.10])[0]
-                    prob = round(rng.uniform(0.75, 0.99), 4)
-                    
-                    # Create oval contour
-                    contour = []
-                    for angle in range(0, 360, 45):
-                        rad = math.radians(angle)
-                        rx = r + rng.uniform(-1, 1)
-                        ry = r + rng.uniform(-1, 1)
-                        contour.append([int(cx + rx * math.cos(rad)), int(cy + ry * math.sin(rad))])
-                    
-                    simulated_nuclei[str(i)] = {
-                        "type": t,
-                        "type_prob": prob,
-                        "centroid": [cx, cy],
-                        "contour": contour,
-                        "bbox": [max(0, cx - r), max(0, cy - r), min(w, cx + r), min(h, cy + r)],
-                    }
+                
+                # HoVer-Net tiles into patches of step_size (default ~164 px)
+                step_size = 164
+                nr_step_w = max(1, math.ceil((w - step_size) / step_size) + 1 if w > step_size else 1)
+                nr_step_h = max(1, math.ceil((h - step_size) / step_size) + 1 if h > step_size else 1)
+                
+                nuc_id = 1
+                for row in range(nr_step_h):
+                    for col in range(nr_step_w):
+                        patch_x1 = int(col * (w / nr_step_w))
+                        patch_x2 = int((col + 1) * (w / nr_step_w))
+                        patch_y1 = int(row * (h / nr_step_h))
+                        patch_y2 = int((row + 1) * (h / nr_step_h))
+                        
+                        # Generate nuclei per patch so the entire ROI is thoroughly populated
+                        patch_count = rng.randint(15, 35)
+                        for _ in range(patch_count):
+                            cx = rng.randint(patch_x1 + 10, max(patch_x1 + 11, patch_x2 - 10))
+                            cy = rng.randint(patch_y1 + 10, max(patch_y1 + 11, patch_y2 - 10))
+                            r = rng.randint(5, 12)
+                            t = rng.choices([1, 2, 3, 4, 5], weights=[0.45, 0.25, 0.15, 0.05, 0.10])[0]
+                            prob = round(rng.uniform(0.75, 0.99), 4)
+                            
+                            # Create smooth oval contour
+                            contour = []
+                            for angle in range(0, 360, 45):
+                                rad = math.radians(angle)
+                                rx = r + rng.uniform(-1, 1)
+                                ry = r + rng.uniform(-1, 1)
+                                contour.append([int(cx + rx * math.cos(rad)), int(cy + ry * math.sin(rad))])
+                            
+                            simulated_nuclei[str(nuc_id)] = {
+                                "type": t,
+                                "type_prob": prob,
+                                "centroid": [cx, cy],
+                                "contour": contour,
+                                "bbox": [max(0, cx - r), max(0, cy - r), min(w, cx + r), min(h, cy + r)],
+                            }
+                            nuc_id += 1
+
                 return {"nuc": simulated_nuclei}
 
             self.start_worker()
