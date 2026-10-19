@@ -28,16 +28,16 @@ def test_csrf_is_enforced(client):
 
 
 def test_user_password_is_hashed(client):
-    response = client.post('/api/users', json={'username':'auditor','display_name':'Auditor','role':'Auditor','password':'safe-password-123'})
+    response = client.post('/api/users', json={'username':'manager','display_name':'Manager','role':'Laboratory Manager','password':'safe-password-123'})
     assert response.status_code in (200, 201), response.text
     with main.connect() as db:
         columns = {row['name'].lower() for row in db.execute("SELECT COLUMN_NAME AS name FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='users'")}
-        user = db.execute('SELECT password_hash FROM users WHERE username=?', ('auditor',)).fetchone()
+        user = db.execute('SELECT password_hash FROM users WHERE username=?', ('manager',)).fetchone()
     assert 'password' not in columns
     assert user['password_hash'] != 'safe-password-123'
 
 
-def test_protected_super_admin_cannot_be_demoted_or_deleted(client):
+def test_protected_system_admin_cannot_be_demoted_or_deleted(client):
     reserved = client.post('/api/users', json={'username':'ETDDev','display_name':'ETD Developer','role':'System Administrator','password':'safe-password-123'})
     extra_super_admin = client.post('/api/users', json={'username':'third-super','display_name':'Third Super','role':'Super Administrator','password':'safe-password-123'})
     assert reserved.status_code == 403
@@ -45,11 +45,11 @@ def test_protected_super_admin_cannot_be_demoted_or_deleted(client):
     with main.connect() as db:
         cursor = db.execute(
             "INSERT INTO users (username,display_name,role,password_hash,is_active) VALUES (?,?,?,?,1)",
-            ('ETDDev','ETD Developer','Super Administrator',main.get_password_hash('safe-password-123')),
+            ('ETDDev','ETD Developer','System Administrator',main.get_password_hash('safe-password-123')),
         )
         user_id = cursor.lastrowid
         db.commit()
-    demote = client.patch(f'/api/users/{user_id}/role', json={'role': 'Auditor'})
+    demote = client.patch(f'/api/users/{user_id}/role', json={'role': 'Laboratory Manager'})
     delete = client.delete(f'/api/users/{user_id}')
     assert demote.status_code == 403
     assert delete.status_code == 403
@@ -274,7 +274,7 @@ def test_case_management_hierarchy_search_timeline_and_governance(client, png_fi
     assert timeline.status_code == 200
     assert {'case-created','slide-ingested','operation'}.issubset({event['event_type'] for event in timeline.json()})
 
-    folder = client.post('/api/platform/research-folders', json={'name':'Study A','allowed_roles':['AI Analyst','Pathologist']})
+    folder = client.post('/api/platform/research-folders', json={'name':'Study A','allowed_roles':['Pathologist']})
     assert folder.status_code == 201, folder.text
     member = client.post(f"/api/platform/research-folders/{folder.json()['id']}/members", json={'case_id':first['id']})
     assert member.status_code == 201
@@ -290,14 +290,40 @@ def test_case_management_hierarchy_search_timeline_and_governance(client, png_fi
     assert operations == 2
 
 
-def test_prs_role_boundaries(client):
+def test_three_role_boundaries(client):
     expectations = {
-        'Laboratory Manager': {'/api/cases': 200, '/api/platform/health': 200, '/api/users': 403},
-        'Pathologist': {'/api/cases': 200, '/api/platform/ai/models': 200, '/api/platform/hl7/events': 403},
-        'Histotechnologist': {'/api/cases': 200, '/api/platform/ingestion/jobs': 200, '/api/users': 403},
-        'AI Analyst': {'/api/cases': 200, '/api/platform/ai/models': 200, '/api/platform/hl7/events': 403},
-        'Integration Engineer': {'/api/cases': 403, '/api/platform/hl7/events': 200, '/api/platform/health': 200},
-        'Auditor': {'/api/cases': 200, '/api/platform/audit': 200, '/api/users': 403},
+        'System Administrator': {
+            '/api/cases': 200,
+            '/api/platform/health': 200,
+            '/api/platform/ingestion/jobs': 200,
+            '/api/platform/ai/models': 200,
+            '/api/platform/hl7/events': 200,
+            '/api/platform/settings': 200,
+            '/api/platform/audit': 200,
+            '/api/users': 200,
+            '/api/patients': 200,
+        },
+        'Laboratory Manager': {
+            '/api/cases': 200,
+            '/api/platform/health': 200,
+            '/api/platform/ingestion/jobs': 200,
+            '/api/patients': 200,
+            '/api/platform/ai/models': 403,
+            '/api/platform/hl7/events': 403,
+            '/api/platform/settings': 403,
+            '/api/platform/audit': 403,
+            '/api/users': 403,
+        },
+        'Pathologist': {
+            '/api/cases': 200,
+            '/api/platform/ai/models': 200,
+            '/api/patients': 200,
+            '/api/platform/ingestion/jobs': 403,
+            '/api/platform/hl7/events': 403,
+            '/api/platform/settings': 403,
+            '/api/platform/audit': 403,
+            '/api/users': 403,
+        },
     }
     try:
         for role, routes in expectations.items():
@@ -307,6 +333,26 @@ def test_prs_role_boundaries(client):
             for route, expected_status in routes.items():
                 response = client.get(route)
                 assert response.status_code == expected_status, f'{role} {route}: {response.text}'
+    finally:
+        with main.connect() as db:
+            db.execute("UPDATE users SET role='System Administrator' WHERE username='admin'")
+            db.commit()
+
+
+def test_pathologist_case_access_is_limited_to_assignments(client):
+    case = create_case(client, case_id='ASSIGNMENT-SCOPE')
+    client.patch(f"/api/cases/{case['id']}/reviewer", json={'reviewer': 'Another Pathologist'})
+    with main.connect() as db:
+        db.execute("UPDATE users SET role='Pathologist' WHERE username='admin'")
+        db.commit()
+    try:
+        assert all(item['id'] != case['id'] for item in client.get('/api/cases').json())
+        assert client.get(f"/api/cases/{case['id']}").status_code == 403
+        with main.connect() as db:
+            db.execute("UPDATE cases SET reviewer='Test Administrator' WHERE id=?", (case['id'],))
+            db.commit()
+        assert any(item['id'] == case['id'] for item in client.get('/api/cases').json())
+        assert client.get(f"/api/cases/{case['id']}").status_code == 200
     finally:
         with main.connect() as db:
             db.execute("UPDATE users SET role='System Administrator' WHERE username='admin'")
