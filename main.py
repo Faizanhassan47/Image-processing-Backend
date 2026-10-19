@@ -578,8 +578,8 @@ async def request_observability(request: Request, call_next):
 
 SECRET_KEY = os.environ["JWT_SECRET_KEY"]
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
-PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "4"))
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "120"))
+PASSWORD_MIN_LENGTH = int(os.getenv("PASSWORD_MIN_LENGTH", "8"))
 COOKIE_SECURE = env_bool("COOKIE_SECURE", False)
 CSRF_PROTECTION_ENABLED = env_bool("CSRF_PROTECTION_ENABLED", True)
 LOGIN_RATE_LIMIT = int(os.getenv("LOGIN_RATE_LIMIT", "5"))
@@ -595,8 +595,14 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 def validate_password(password: str):
-    if len(password or "") < PASSWORD_MIN_LENGTH:
+    pwd = password or ""
+    if len(pwd) < PASSWORD_MIN_LENGTH:
         raise HTTPException(status_code=400, detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters")
+    if env_bool("REQUIRE_PASSWORD_COMPLEXITY", True):
+        has_letter = any(ch.isalpha() for ch in pwd)
+        has_digit = any(ch.isdigit() for ch in pwd)
+        if not (has_letter and has_digit):
+            raise HTTPException(status_code=400, detail="Password must contain both letters and numbers")
 
 def audit(db, actor: str, action: str, target_type: str, target_id="", details=""):
     metadata = get_audit_context()
@@ -1768,11 +1774,8 @@ def export_report_html(report_id: int):
     return Response(document,media_type="text/html",headers={"Content-Disposition":f"attachment; filename=report_{case['case_id']}_v{report['version']}.html"})
 
 
-# Enterprise extension APIs are registered after the core dependencies exist to
-# avoid coupling their adapter contracts to FastAPI application construction.
-from platform_api import create_platform_router, init_platform_schema
-init_platform_schema(connect)
-app.include_router(create_platform_router(connect, require_roles, get_current_user, UPLOADS, openslide))
-from patient_api import create_patient_router, init_patient_schema
-init_patient_schema(connect)
-app.include_router(create_patient_router(connect, require_roles, audit, UPLOADS))
+# Centralized Services APIs are registered through the services layer
+from services.api import create_services_router, init_services_schemas
+init_services_schemas(connect)
+app.include_router(create_services_router(connect, require_roles, get_current_user, audit, UPLOADS, openslide))
+

@@ -61,6 +61,13 @@ DDL = [
     "IF COL_LENGTH('patients','updated_by') IS NULL ALTER TABLE patients ADD updated_by VARCHAR(255) NULL",
     "IF COL_LENGTH('patients','updated_at') IS NULL ALTER TABLE patients ADD updated_at DATETIME2 NOT NULL CONSTRAINT DF_patients_updated DEFAULT SYSUTCDATETIME()",
     "IF COL_LENGTH('patients','archived_at') IS NULL ALTER TABLE patients ADD archived_at DATETIME2 NULL",
+    "IF COL_LENGTH('patients','organization_id') IS NULL ALTER TABLE patients ADD organization_id VARCHAR(100) NULL",
+    "IF COL_LENGTH('patients','facility_name') IS NULL ALTER TABLE patients ADD facility_name NVARCHAR(255) NULL",
+    "IF COL_LENGTH('patients','department') IS NULL ALTER TABLE patients ADD department NVARCHAR(255) NULL",
+    "IF COL_LENGTH('patients','care_team') IS NULL ALTER TABLE patients ADD care_team NVARCHAR(MAX) NULL",
+    "IF COL_LENGTH('patients','consent_status') IS NULL ALTER TABLE patients ADD consent_status VARCHAR(50) NOT NULL CONSTRAINT DF_patients_consent DEFAULT 'Granted'",
+    "IF COL_LENGTH('patients','legal_hold') IS NULL ALTER TABLE patients ADD legal_hold BIT NOT NULL CONSTRAINT DF_patients_legal_hold DEFAULT 0",
+    "IF COL_LENGTH('patients','retention_until') IS NULL ALTER TABLE patients ADD retention_until DATETIME2 NULL",
     "UPDATE patients SET patient_identifier=CONCAT('PAT-',RIGHT(CONCAT('000000',CAST(id AS VARCHAR(20))),6)) WHERE patient_identifier IS NULL",
     "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_identifier' AND object_id=OBJECT_ID('patients')) CREATE UNIQUE INDEX UQ_patients_identifier ON patients(patient_identifier) WHERE patient_identifier IS NOT NULL",
     "IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_mrn' AND object_id=OBJECT_ID('patients')) CREATE UNIQUE INDEX UQ_patients_mrn ON patients(medical_record_number) WHERE medical_record_number IS NOT NULL",
@@ -115,7 +122,12 @@ DDL = [
         id INT IDENTITY PRIMARY KEY, patient_id INT NOT NULL REFERENCES patients(id), case_id INT NULL REFERENCES cases(id),
         document_type VARCHAR(80) NOT NULL, original_filename NVARCHAR(512) NOT NULL, stored_filename VARCHAR(512) NOT NULL UNIQUE,
         content_type VARCHAR(120) NOT NULL, file_size BIGINT NOT NULL, checksum_sha256 VARCHAR(64) NOT NULL,
-        description NVARCHAR(1000) NULL, uploaded_by VARCHAR(255) NOT NULL, created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), archived_at DATETIME2 NULL)""",
+        description NVARCHAR(1000) NULL, uploaded_by VARCHAR(255) NOT NULL, created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), archived_at DATETIME2 NULL,
+        scan_status VARCHAR(50) NOT NULL DEFAULT 'Clean', quarantine_reason NVARCHAR(1000) NULL, approved_by VARCHAR(255) NULL, approved_at DATETIME2 NULL)""",
+    "IF COL_LENGTH('patient_documents','scan_status') IS NULL ALTER TABLE patient_documents ADD scan_status VARCHAR(50) NOT NULL CONSTRAINT DF_patient_doc_scan DEFAULT 'Clean'",
+    "IF COL_LENGTH('patient_documents','quarantine_reason') IS NULL ALTER TABLE patient_documents ADD quarantine_reason NVARCHAR(1000) NULL",
+    "IF COL_LENGTH('patient_documents','approved_by') IS NULL ALTER TABLE patient_documents ADD approved_by VARCHAR(255) NULL",
+    "IF COL_LENGTH('patient_documents','approved_at') IS NULL ALTER TABLE patient_documents ADD approved_at DATETIME2 NULL",
     """IF OBJECT_ID('patient_imports','U') IS NULL CREATE TABLE patient_imports (
         id INT IDENTITY PRIMARY KEY, patient_id INT NULL REFERENCES patients(id), schema_version VARCHAR(20) NOT NULL,
         source_identifier VARCHAR(255) NULL, payload_hash VARCHAR(64) NOT NULL, status VARCHAR(30) NOT NULL,
@@ -153,6 +165,13 @@ class PatientCreate(BaseModel):
     address: str | None = Field(default=None, max_length=1000)
     status: str = Field(default="Active", pattern=r"^(Active|Inactive|Deceased|Archived)$")
     additional_details: dict = Field(default_factory=dict)
+    organization_id: str | None = Field(default=None, max_length=100)
+    facility_name: str | None = Field(default=None, max_length=255)
+    department: str | None = Field(default=None, max_length=255)
+    care_team: list[str] | str | None = None
+    consent_status: str = Field(default="Granted", pattern=r"^(Granted|Revoked|Restricted|Pending)$")
+    legal_hold: bool = False
+    retention_until: datetime | None = None
 
     @field_validator("cnic", mode="before")
     @classmethod
@@ -187,6 +206,13 @@ class PatientUpdate(BaseModel):
     address: str | None = Field(default=None, max_length=1000)
     status: str | None = Field(default=None, pattern=r"^(Active|Inactive|Deceased|Archived)$")
     additional_details: dict | None = None
+    organization_id: str | None = Field(default=None, max_length=100)
+    facility_name: str | None = Field(default=None, max_length=255)
+    department: str | None = Field(default=None, max_length=255)
+    care_team: list[str] | str | None = None
+    consent_status: str | None = Field(default=None, pattern=r"^(Granted|Revoked|Restricted|Pending)$")
+    legal_hold: bool | None = None
+    retention_until: datetime | None = None
 
     @field_validator("cnic", mode="before")
     @classmethod
@@ -351,8 +377,9 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
             if duplicate:
                 raise HTTPException(409, detail={"message": "A patient with this identifier already exists", "patient_id": duplicate["id"]})
             try:
-                cur = db.execute("""INSERT INTO patients (external_id,display_label,patient_identifier,cnic,medical_record_number,first_name,middle_name,last_name,date_of_birth,sex,gender_identity,blood_group,phone,address,status,demographics_json,created_by,updated_by)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (item.external_id, display, item.patient_identifier, item.cnic, item.medical_record_number, item.first_name, item.middle_name, item.last_name, item.date_of_birth, item.sex, item.gender_identity, item.blood_group, item.phone, item.address, item.status, json.dumps(item.additional_details), user["username"], user["username"]))
+                care_team_str = json.dumps(item.care_team) if isinstance(item.care_team, list) else item.care_team
+                cur = db.execute("""INSERT INTO patients (external_id,display_label,patient_identifier,cnic,medical_record_number,first_name,middle_name,last_name,date_of_birth,sex,gender_identity,blood_group,phone,address,status,demographics_json,created_by,updated_by,organization_id,facility_name,department,care_team,consent_status,legal_hold,retention_until)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (item.external_id, display, item.patient_identifier, item.cnic, item.medical_record_number, item.first_name, item.middle_name, item.last_name, item.date_of_birth, item.sex, item.gender_identity, item.blood_group, item.phone, item.address, item.status, json.dumps(item.additional_details), user["username"], user["username"], item.organization_id, item.facility_name, item.department, care_team_str, item.consent_status, 1 if item.legal_hold else 0, item.retention_until))
                 patient_id = cur.lastrowid
                 identifier = item.patient_identifier or f"PAT-{patient_id:06d}"
                 db.execute("UPDATE patients SET patient_identifier=? WHERE id=?", (identifier, patient_id))
@@ -373,7 +400,11 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
         values = item.model_dump(exclude_unset=True)
         additional = values.pop("additional_details", None)
         if not values and additional is None: raise HTTPException(400, "No changes supplied")
-        allowed = {"cnic", "medical_record_number", "external_id", "first_name", "middle_name", "last_name", "date_of_birth", "sex", "gender_identity", "blood_group", "phone", "address", "status"}
+        allowed = {"cnic", "medical_record_number", "external_id", "first_name", "middle_name", "last_name", "date_of_birth", "sex", "gender_identity", "blood_group", "phone", "address", "status", "organization_id", "facility_name", "department", "care_team", "consent_status", "legal_hold", "retention_until"}
+        if "care_team" in values and isinstance(values["care_team"], list):
+            values["care_team"] = json.dumps(values["care_team"])
+        if "legal_hold" in values and values["legal_hold"] is not None:
+            values["legal_hold"] = 1 if values["legal_hold"] else 0
         if "cnic" in values and values["cnic"] is None: values.pop("cnic")
         with connect() as db:
             current = _patient_or_404(db, patient_id)
@@ -400,6 +431,8 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
     def delete_patient(patient_id: int, user=Depends(require_roles(ADMIN_ROLES))):
         with connect() as db:
             patient = _patient_or_404(db, patient_id)
+            if bool(patient.get("legal_hold")):
+                raise HTTPException(400, "Cannot delete patient record under active legal hold")
             # Unlink accessions so cases are preserved
             db.execute("UPDATE accessions SET patient_id=NULL WHERE patient_id=?", (patient_id,))
             # Remove associated child clinical and longitudinal data
@@ -585,20 +618,40 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
         with connect() as db:
             _patient_or_404(db,patient_id)
             if case_id and not db.execute("SELECT 1 ok FROM accessions WHERE patient_id=? AND case_id=?",(patient_id,case_id)).fetchone(): raise HTTPException(400,"Case is not linked to this patient")
+            # Malware scanning check: Detect suspicious signatures (EICAR test or executable signatures)
+            is_malware = b"X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*" in data or data.startswith(b"MZ")
+            scan_status = "Quarantined" if is_malware else "Clean"
+            quarantine_reason = "Malware signature or suspicious executable pattern detected" if is_malware else None
+
             try:
                 path.write_bytes(data)
-                doc_id=db.execute("INSERT INTO patient_documents (patient_id,case_id,document_type,original_filename,stored_filename,content_type,file_size,checksum_sha256,description,uploaded_by) VALUES (?,?,?,?,?,?,?,?,?,?)",(patient_id,case_id,document_type,(file.filename or "document")[:512],stored,content_type,len(data),hashlib.sha256(data).hexdigest(),description[:1000],user["username"])).lastrowid
-                audit(db,user["username"],"patient.document.upload","patient",patient_id,json.dumps({"document_id":doc_id,"document_type":document_type,"file_size":len(data)})); db.commit()
+                doc_id=db.execute("INSERT INTO patient_documents (patient_id,case_id,document_type,original_filename,stored_filename,content_type,file_size,checksum_sha256,description,uploaded_by,scan_status,quarantine_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",(patient_id,case_id,document_type,(file.filename or "document")[:512],stored,content_type,len(data),hashlib.sha256(data).hexdigest(),description[:1000],user["username"],scan_status,quarantine_reason)).lastrowid
+                audit(db,user["username"],"patient.document.upload","patient",patient_id,json.dumps({"document_id":doc_id,"document_type":document_type,"file_size":len(data),"scan_status":scan_status})); db.commit()
             except Exception:
                 if path.exists(): path.unlink()
                 raise
         return {"id":doc_id,"patient_id":patient_id,"original_filename":file.filename,"content_type":content_type,"file_size":len(data)}
+
+    @router.post("/{patient_id}/documents/{document_id}/quarantine-action")
+    def quarantine_action(patient_id: int, document_id: int, action: str = Form(..., pattern=r"^(approve|reject)$"), reason: str = Form(""), user=Depends(require_roles(["System Administrator", "Laboratory Manager"]))):
+        with connect() as db:
+            _patient_or_404(db, patient_id)
+            row = db.execute("SELECT * FROM patient_documents WHERE id=? AND patient_id=? AND archived_at IS NULL", (document_id, patient_id)).fetchone()
+            if not row: raise HTTPException(404, "Document not found")
+            new_status = "Clean" if action == "approve" else "Rejected"
+            db.execute("UPDATE patient_documents SET scan_status=?, approved_by=?, approved_at=SYSUTCDATETIME(), quarantine_reason=? WHERE id=?",
+                       (new_status, user["username"], reason or f"Quarantine {action}d by {user['username']}", document_id))
+            audit(db, user["username"], f"patient.document.quarantine_{action}", "patient", patient_id, json.dumps({"document_id": document_id, "status": new_status, "reason": reason}))
+            db.commit()
+            return {"message": f"Document quarantine {action}d successfully", "scan_status": new_status, "document_id": document_id}
 
     @router.get("/{patient_id}/documents/{document_id}/download")
     def download_document(patient_id:int,document_id:int,user=Depends(require_roles(READ_ROLES))):
         with connect() as db:
             row=db.execute("SELECT * FROM patient_documents WHERE id=? AND patient_id=? AND archived_at IS NULL",(document_id,patient_id)).fetchone()
             if not row: raise HTTPException(404,"Document not found")
+            if row.get("scan_status") in ("Quarantined", "Rejected") and user["role"] not in ("System Administrator", "Laboratory Manager"):
+                raise HTTPException(403, "Access to quarantined or rejected document is restricted until approved")
             audit(db,user["username"],"patient.document.download","patient",patient_id,json.dumps({"document_id":document_id})); db.commit()
         path=(documents_dir/row["stored_filename"]).resolve()
         if path.parent != documents_dir or not path.is_file(): raise HTTPException(404,"Stored document is unavailable")
