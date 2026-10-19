@@ -10,6 +10,7 @@ from PIL import Image
 
 import main
 from platform_api import init_platform_schema
+from patient_api import init_patient_schema
 
 
 def _server_connection(database):
@@ -34,6 +35,7 @@ def sql_test_database():
     try:
         main.init_db()
         init_platform_schema(main.connect)
+        init_patient_schema(main.connect)
         yield database
     finally:
         main.slide_cache.clear()
@@ -50,7 +52,7 @@ def client(sql_test_database, tmp_path, monkeypatch):
     monkeypatch.setattr(main, 'UPLOADS', uploads)
     main.slide_cache.clear()
     with main.connect() as db:
-        for table in ('research_folder_access','research_folder_members','research_folders','case_links','case_operations','viewer_bookmarks','viewer_preferences','case_consultations','report_reviews','report_findings','reports','report_templates','annotation_revisions','annotations','ai_results','ai_jobs','image_metadata_revisions','image_versions','reconciliation_items','ingestion_jobs','audit_log','case_review_history','case_review_notes','slide_qc_history','slides','blocks','specimens','accessions','patients','cases','users'):
+        for table in ('patient_imports','patient_documents','patient_clinical_note_revisions','patient_clinical_notes','patient_test_results','patient_tests','patient_encounters','patient_medical_history_revisions','patient_medical_history','patient_identity_mappings','research_folder_access','research_folder_members','research_folders','case_links','case_operations','viewer_bookmarks','viewer_preferences','case_consultations','report_reviews','report_findings','reports','report_templates','annotation_revisions','annotations','ai_results','ai_jobs','image_metadata_revisions','image_versions','reconciliation_items','ingestion_jobs','audit_log','case_review_history','case_review_notes','slide_qc_history','slides','blocks','specimens','accessions','patients','cases','users'):
             if db.execute("SELECT OBJECT_ID(?, 'U') AS id", (table,)).fetchone()['id']:
                 db.execute(f'DELETE FROM [{table}]')
         password_hash = main.get_password_hash('test-password-123')
