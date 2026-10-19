@@ -16,9 +16,9 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from image_validation import ImageValidationError, validate_image_file
-from audit_context import get_audit_context
-from scanner_adapters import ADAPTERS, CONVERTERS
+from services.image_validation import ImageValidationError, validate_image_file
+from core.audit_context import get_audit_context
+from services.scanner_adapters import ADAPTERS, CONVERTERS
 
 logger = logging.getLogger('pathology.ingestion')
 
@@ -354,17 +354,20 @@ async def watched_folder_loop(connect, stop_event):
         except TimeoutError: pass
 
 def create_platform_router(connect, require_roles, get_current_user, uploads_dir: Path, openslide_module=None):
+    from core import (
+        ADMIN_ROLES as administrators,
+        INTAKE_ROLES as intake_roles,
+        AI_RUN_ROLES as ai_roles,
+        INTEGRATION_ROLES as integration_roles,
+        OPERATIONAL_ROLES as operational_roles,
+        CLINICAL_READ_ROLES as clinical_read_roles,
+        AUDIT_ROLES as audit_roles,
+    )
     router = APIRouter(prefix='/api/platform', tags=['platform'])
-    administrators = ['System Administrator']
-    intake_roles = ['System Administrator', 'Laboratory Manager']
-    ai_roles = ['System Administrator', 'Pathologist']
-    integration_roles = ['System Administrator']
-    operational_roles = ['System Administrator', 'Laboratory Manager']
-    clinical_read_roles = ['System Administrator', 'Laboratory Manager', 'Pathologist']
-    audit_roles = ['System Administrator']
     quarantine_dir = Path(os.getenv('QUARANTINE_DIR', uploads_dir.parent / 'quarantine'))
     if not quarantine_dir.is_absolute(): quarantine_dir = uploads_dir.parent / quarantine_dir
     quarantine_dir.mkdir(parents=True, exist_ok=True)
+
 
     @router.get('/patients')
     def patients(_=Depends(require_roles(clinical_read_roles))):
@@ -1024,6 +1027,116 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         with connect() as db:
             db.execute("UPDATE integration_events SET acknowledgement=?,status=?,processed_at=SYSUTCDATETIME() WHERE id=?",(ack,'Acknowledged' if accepted else 'Rejected',event_id)); db.commit()
         return {'id':event_id,'acknowledgement':ack,'status':'Acknowledged' if accepted else 'Rejected'}
+
+    @router.get('/dashboard/metrics')
+    def dashboard_metrics(_=Depends(require_roles(operational_roles))):
+        """Calculates real-time operational and laboratory workflow metrics from SQL Server database."""
+        with connect() as db:
+            # Case counts by status
+            total_cases = db.execute("SELECT COUNT(*) AS n FROM cases").fetchone()['n']
+            new_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE status='New'").fetchone()['n']
+            in_review_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE status='In Review'").fetchone()['n']
+            reviewed_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE status='Reviewed'").fetchone()['n']
+            unassigned_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE reviewer IS NULL OR reviewer=''").fetchone()['n']
+            urgent_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE priority IN ('Urgent', 'Stat')").fetchone()['n']
+            overdue_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE due_at IS NOT NULL AND due_at < SYSUTCDATETIME() AND status <> 'Reviewed'").fetchone()['n']
+
+            # Slide QC metrics
+            total_slides = db.execute("SELECT COUNT(*) AS n FROM slides").fetchone()['n']
+            qc_pending = db.execute("SELECT COUNT(*) AS n FROM slides WHERE qc_status IS NULL OR qc_status='' OR qc_status='Pending'").fetchone()['n']
+            qc_exceptions = db.execute("SELECT COUNT(*) AS n FROM slides WHERE qc_status='Needs rescan'").fetchone()['n']
+
+            # Reporting metrics
+            pending_reports = db.execute("SELECT COUNT(*) AS n FROM reports WHERE workflow_status IN ('Draft', 'Pending Review')").fetchone()['n']
+            approved_reports = db.execute("SELECT COUNT(*) AS n FROM reports WHERE workflow_status='Approved'").fetchone()['n']
+
+            # Ingestion metrics
+            total_ingestions = db.execute("SELECT COUNT(*) AS n FROM ingestion_jobs").fetchone()['n']
+            failed_ingestions = db.execute("SELECT COUNT(*) AS n FROM ingestion_jobs WHERE status IN ('Failed', 'Quarantined')").fetchone()['n']
+            reconciliation_count = db.execute("SELECT COUNT(*) AS n FROM reconciliation_items WHERE resolved_case_id IS NULL").fetchone()['n']
+
+            # Turnaround time calculations (in hours) based on actual history and creation timestamps
+            # 1. Registration to Assignment (hours)
+            tat_reg_to_assign = db.execute("""
+                SELECT AVG(DATEDIFF(MINUTE, c.created_at, h.created_at) / 60.0) AS avg_hours
+                FROM cases c
+                JOIN case_review_history h ON h.case_id = c.id
+                WHERE h.change_type = 'reviewer' AND h.new_value IS NOT NULL AND h.new_value <> ''
+            """).fetchone()['avg_hours'] or 0.0
+
+            # 2. Assignment to Review (hours)
+            tat_assign_to_review = db.execute("""
+                SELECT AVG(DATEDIFF(MINUTE, h1.created_at, h2.created_at) / 60.0) AS avg_hours
+                FROM case_review_history h1
+                JOIN case_review_history h2 ON h1.case_id = h2.case_id
+                WHERE h1.change_type = 'reviewer' AND h2.change_type = 'status' AND h2.new_value = 'In Review'
+                  AND h2.created_at >= h1.created_at
+            """).fetchone()['avg_hours'] or 0.0
+
+            # 3. Overall Case Completion TAT (Registration to Final Report Approval or Reviewed status)
+            tat_overall_completion = db.execute("""
+                SELECT AVG(DATEDIFF(MINUTE, c.created_at, COALESCE(r.approved_at, h.created_at)) / 60.0) AS avg_hours
+                FROM cases c
+                LEFT JOIN reports r ON r.case_id = c.id AND r.workflow_status = 'Approved'
+                LEFT JOIN case_review_history h ON h.case_id = c.id AND h.change_type = 'status' AND h.new_value = 'Reviewed'
+                WHERE r.approved_at IS NOT NULL OR h.created_at IS NOT NULL
+            """).fetchone()['avg_hours'] or 0.0
+
+            # Pathologist workload breakdown
+            pathologist_workload = [
+                dict(row) for row in db.execute("""
+                    SELECT COALESCE(NULLIF(reviewer, ''), 'Unassigned') AS pathologist,
+                           COUNT(*) AS active_cases,
+                           SUM(CASE WHEN priority IN ('Urgent', 'Stat') THEN 1 ELSE 0 END) AS urgent_cases,
+                           SUM(CASE WHEN due_at IS NOT NULL AND due_at < SYSUTCDATETIME() AND status <> 'Reviewed' THEN 1 ELSE 0 END) AS overdue_cases
+                    FROM cases
+                    WHERE status <> 'Reviewed'
+                    GROUP BY reviewer
+                    ORDER BY active_cases DESC
+                """).fetchall()
+            ]
+
+            # Storage capacity metrics
+            usage = shutil.disk_usage(uploads_dir)
+
+            return {
+                'cases': {
+                    'total': total_cases,
+                    'new': new_cases,
+                    'in_review': in_review_cases,
+                    'reviewed': reviewed_cases,
+                    'unassigned': unassigned_cases,
+                    'urgent': urgent_cases,
+                    'overdue': overdue_cases,
+                },
+                'slides': {
+                    'total': total_slides,
+                    'qc_pending': qc_pending,
+                    'qc_exceptions': qc_exceptions,
+                },
+                'reports': {
+                    'pending_review': pending_reports,
+                    'approved': approved_reports,
+                },
+                'ingestion': {
+                    'total_jobs': total_ingestions,
+                    'failed_or_quarantined': failed_ingestions,
+                    'awaiting_reconciliation': reconciliation_count,
+                },
+                'turnaround_time_hours': {
+                    'registration_to_assignment': round(float(tat_reg_to_assign), 1),
+                    'assignment_to_review': round(float(tat_assign_to_review), 1),
+                    'overall_completion': round(float(tat_overall_completion), 1),
+                },
+                'pathologist_workload': pathologist_workload,
+                'storage': {
+                    'total_bytes': usage.total,
+                    'used_bytes': usage.used,
+                    'free_bytes': usage.free,
+                    'used_percent': round(usage.used / usage.total * 100, 1),
+                },
+                'generated_at': datetime.now(timezone.utc).isoformat(),
+            }
 
     @router.get('/health')
     def health(request: Request, _=Depends(require_roles(operational_roles))):

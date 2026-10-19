@@ -1,3 +1,18 @@
-from .api import create_services_router, init_services_schemas
+"""
+Services package initialization.
+Exports image validation, AI engine, scanner adapters, and slide caching utilities.
+"""
 
-__all__ = ["create_services_router", "init_services_schemas"]
+from .image_validation import ImageValidationError, validate_image_file
+from .scanner_adapters import ADAPTERS, CONVERTERS
+from .slide_cache import DeepZoomGenerator, openslide, slide_cache
+
+__all__ = [
+    "ImageValidationError",
+    "validate_image_file",
+    "ADAPTERS",
+    "CONVERTERS",
+    "DeepZoomGenerator",
+    "openslide",
+    "slide_cache",
+]

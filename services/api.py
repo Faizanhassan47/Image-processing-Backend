@@ -5,8 +5,8 @@ Exports and manages enterprise endpoints and services.
 
 from pathlib import Path
 from fastapi import APIRouter
-from patient_api import create_patient_router, init_patient_schema
-from platform_api import create_platform_router, init_platform_schema
+from routes.patient_api import create_patient_router, init_patient_schema
+from routes.platform_api import create_platform_router, init_platform_schema
 
 __all__ = [
     "create_services_router",

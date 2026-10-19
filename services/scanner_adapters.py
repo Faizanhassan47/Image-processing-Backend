@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from image_validation import RASTER_EXTENSIONS, WSI_EXTENSIONS, validate_image_file
+from services.image_validation import RASTER_EXTENSIONS, WSI_EXTENSIONS, validate_image_file
 
 
 class ScannerAdapter(Protocol):
