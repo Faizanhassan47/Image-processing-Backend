@@ -19,6 +19,7 @@ from .security import (
     ROLE_ADMIN,
     ROLE_LAB_MANAGER,
     ROLE_PATHOLOGIST,
+    ROLE_AUDITOR,
     USER_ROLES,
     ASSIGNABLE_USER_ROLES,
     ADMIN_ROLES,

@@ -11,6 +11,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import shutil
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
@@ -185,6 +186,17 @@ def create_cases_router(
         if suffix == ".svs" and openslide is None:
             await upload.close()
             raise HTTPException(503, "WSI upload requires OpenSlide. Install openslide-python or configure OPENSLIDE_PATH.")
+        # Storage Guard: Prevent ingestion if storage free space is critically low (< 256 MB)
+        try:
+            usage = shutil.disk_usage(uploads_dir)
+            if usage.free < 256 * 1024 * 1024:
+                await upload.close()
+                raise HTTPException(507, "Insufficient storage capacity to accept whole-slide images")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+
         filename = f"{uuid4().hex}{suffix}"
         path = stored_path_fn(filename)
         try:
@@ -205,18 +217,32 @@ def create_cases_router(
             raise HTTPException(400, "Slide label must be 1 to 120 characters")
         stored = await validate_and_store(image)
         filename, validation = stored
+        qc_meta = validation.get("image_qc") or {}
+        qc_status_init = "Flagged" if qc_meta.get("qc_status") == "Flagged" else "Passed"
+        qc_blur_flag = 1 if not qc_meta.get("is_sharp", True) else 0
+        qc_tissue_flag = 1 if not qc_meta.get("has_tissue", True) else 0
+        qc_note_init = "; ".join(qc_meta.get("flags") or []) if qc_meta.get("flags") else "Automated optical QC passed"
         try:
             with closing(connect()) as db:
-                duplicate = db.execute("SELECT TOP 1 stored_filename FROM image_versions WHERE checksum_sha256=?", (validation["checksum_sha256"],)).fetchone()
+                duplicate = db.execute("""
+                    SELECT TOP 1 iv.stored_filename, c.case_id AS case_code
+                    FROM image_versions iv
+                    JOIN slides s ON s.id = iv.slide_id
+                    JOIN cases c ON c.id = s.case_id
+                    WHERE iv.checksum_sha256 = ?
+                """, (validation["checksum_sha256"],)).fetchone()
                 if duplicate:
-                    raise HTTPException(409, "Duplicate image content already exists")
+                    case_ref = duplicate["case_code"] if duplicate.get("case_code") else "another active case"
+                    raise HTTPException(409, f"Duplicate image content already exists in Case '{case_ref}'")
                 cursor = db.execute("""INSERT INTO slides
                     (case_id, label, stain, specimen_description, filename, file_type,
-                     format, file_size, width, height, level_count, upload_state)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready')""",
+                     format, file_size, width, height, level_count, upload_state,
+                     qc_status, qc_blur, qc_missing_tissue, qc_note, qc_actor, qc_timestamp)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 'System Automated QC', SYSUTCDATETIME())""",
                     (case_pk, label, stain.strip(), specimen_description.strip(), filename,
                      validation["file_type"], validation["format"], validation["file_size"],
-                     validation["width"], validation["height"], validation["level_count"]))
+                     validation["width"], validation["height"], validation["level_count"],
+                     qc_status_init, qc_blur_flag, qc_tissue_flag, qc_note_init))
                 calibration = validation["physical_calibration"]
                 pixel_size = calibration["pixel_size_microns_x"] if calibration["available"] else None
                 db.execute("""INSERT INTO image_versions
@@ -471,12 +497,15 @@ def create_cases_router(
     # --- WSI DeepZoom & Image Rendering Endpoints ---
 
     @router.get("/api/slides/{slide_id}/image", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def slide_image(slide_id: int):
-        return raster_response(get_slide_fn(slide_id))
+    def slide_image(slide_id: int, current_user: dict = Depends(get_current_user)):
+        slide = get_slide_fn(slide_id)
+        require_assigned_case_fn(get_case_fn(slide["case_id"]), current_user)
+        return raster_response(slide)
 
     @router.get("/api/slides/{slide_id}/thumbnail", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def slide_thumbnail(slide_id: int):
+    def slide_thumbnail(slide_id: int, current_user: dict = Depends(get_current_user)):
         row = get_slide_fn(slide_id)
+        require_assigned_case_fn(get_case_fn(row["case_id"]), current_user)
         if row["file_type"] == "raster":
             return raster_response(row)
         _, path = require_wsi_slide(slide_id)
@@ -487,8 +516,9 @@ def create_cases_router(
         return Response(output.getvalue(), media_type="image/jpeg", headers={"Cache-Control": "private, max-age=3600"})
 
     @router.get("/api/slides/{slide_id}/slide", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def slide_metadata(slide_id: int):
+    def slide_metadata(slide_id: int, current_user: dict = Depends(get_current_user)):
         row, path = require_wsi_slide(slide_id)
+        require_assigned_case_fn(get_case_fn(row["case_id"]), current_user)
         with slide_cache.acquire(path) as slide:
             deep_zoom = DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP)
             return {
@@ -503,14 +533,17 @@ def create_cases_router(
             }
 
     @router.get("/api/slides/{slide_id}/slide.dzi", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def slide_descriptor(slide_id: int):
-        _, path = require_wsi_slide(slide_id)
+    def slide_descriptor(slide_id: int, current_user: dict = Depends(get_current_user)):
+        row, path = require_wsi_slide(slide_id)
+        require_assigned_case_fn(get_case_fn(row["case_id"]), current_user)
         with slide_cache.acquire(path) as slide:
             descriptor = DeepZoomGenerator(slide, tile_size=TILE_SIZE, overlap=TILE_OVERLAP).get_dzi("jpeg")
         return Response(descriptor, media_type="application/xml", headers={"Cache-Control": "private, max-age=3600"})
 
     @router.get("/api/slides/{slide_id}/slide_files/{level}/{column}_{row}.jpeg", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def slide_tile(slide_id: int, level: int, column: int, row: int):
+    def slide_tile(slide_id: int, level: int, column: int, row: int, current_user: dict = Depends(get_current_user)):
+        slide = get_slide_fn(slide_id)
+        require_assigned_case_fn(get_case_fn(slide["case_id"]), current_user)
         if min(level, column, row) < 0:
             raise HTTPException(404, "Tile not found")
 
@@ -541,23 +574,25 @@ def create_cases_router(
     # --- Legacy Case-Level Resolution Aliases ---
 
     @router.get("/api/cases/{case_pk}/image", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def legacy_image(case_pk: int):
-        return raster_response(first_slide(case_pk))
+    def legacy_image(case_pk: int, current_user: dict = Depends(get_current_user)):
+        slide = first_slide(case_pk)
+        require_assigned_case_fn(get_case_fn(case_pk), current_user)
+        return raster_response(slide)
 
     @router.get("/api/cases/{case_pk}/thumbnail", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def legacy_thumbnail(case_pk: int):
-        return slide_thumbnail(first_slide(case_pk)["id"])
+    def legacy_thumbnail(case_pk: int, current_user: dict = Depends(get_current_user)):
+        return slide_thumbnail(first_slide(case_pk)["id"], current_user=current_user)
 
     @router.get("/api/cases/{case_pk}/slide", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def legacy_metadata(case_pk: int):
-        return slide_metadata(first_slide(case_pk)["id"])
+    def legacy_metadata(case_pk: int, current_user: dict = Depends(get_current_user)):
+        return slide_metadata(first_slide(case_pk)["id"], current_user=current_user)
 
     @router.get("/api/cases/{case_pk}/slide.dzi", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def legacy_descriptor(case_pk: int):
-        return slide_descriptor(first_slide(case_pk)["id"])
+    def legacy_descriptor(case_pk: int, current_user: dict = Depends(get_current_user)):
+        return slide_descriptor(first_slide(case_pk)["id"], current_user=current_user)
 
     @router.get("/api/cases/{case_pk}/slide_files/{level}/{column}_{row}.jpeg", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def legacy_tile(case_pk: int, level: int, column: int, row: int):
-        return slide_tile(first_slide(case_pk)["id"], level, column, row)
+    def legacy_tile(case_pk: int, level: int, column: int, row: int, current_user: dict = Depends(get_current_user)):
+        return slide_tile(first_slide(case_pk)["id"], level, column, row, current_user=current_user)
 
     return router

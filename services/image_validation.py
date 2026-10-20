@@ -165,6 +165,14 @@ def validate_image_file(path: Path, openslide_module=None) -> dict[str, Any]:
         raise ImageValidationError("Image file is empty")
 
     details = _validate_raster(path) if suffix in RASTER_EXTENSIONS else _validate_wsi(path, openslide_module)
+    
+    # Run deterministic image QC
+    try:
+        from services.image_qc import compute_deterministic_qc
+        qc_metrics = compute_deterministic_qc(path)
+    except Exception:
+        qc_metrics = {"qc_status": "Unverified", "flags": [], "sharpness_score": None}
+
     details.update({
         "valid": True,
         "supported": True,
@@ -174,5 +182,6 @@ def validate_image_file(path: Path, openslide_module=None) -> dict[str, Any]:
         "checksum_sha256": calculate_sha256(path),
         "duplicate": False,
         "duplicate_of": None,
+        "image_qc": qc_metrics,
     })
     return details

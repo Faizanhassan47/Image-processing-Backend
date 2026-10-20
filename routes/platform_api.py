@@ -13,12 +13,19 @@ import shutil
 import time
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from services.image_validation import ImageValidationError, validate_image_file
 from core.audit_context import get_audit_context
 from services.scanner_adapters import ADAPTERS, CONVERTERS
+from services.hl7_engine import (
+    SAMPLE_MESSAGES,
+    extract_canonical_records,
+    generate_hl7_ack,
+    parse_raw_hl7,
+    validate_hl7_structure,
+)
 
 logger = logging.getLogger('pathology.ingestion')
 
@@ -28,7 +35,7 @@ DDL = [
 """IF COL_LENGTH('cases','due_at') IS NULL ALTER TABLE cases ADD due_at DATETIME2 NULL""",
 """IF COL_LENGTH('cases','exception_reason') IS NULL ALTER TABLE cases ADD exception_reason VARCHAR(2000) NULL""",
 """IF OBJECT_ID('patients','U') IS NULL CREATE TABLE patients (
- id INT IDENTITY PRIMARY KEY, external_id VARCHAR(255) UNIQUE, display_label VARCHAR(255) NOT NULL,
+ id INT IDENTITY PRIMARY KEY, external_id VARCHAR(255) NULL, display_label VARCHAR(255) NOT NULL,
  created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME())""",
 """IF OBJECT_ID('accessions','U') IS NULL CREATE TABLE accessions (
  id INT IDENTITY PRIMARY KEY, case_id INT NULL REFERENCES cases(id), patient_id INT NULL REFERENCES patients(id), accession_number VARCHAR(255) UNIQUE NOT NULL,
@@ -1002,13 +1009,123 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
               (item.name,item.direction,item.version,item.transport,item.host,item.port,int(item.enabled),json.dumps(item.mapping))); db.commit()
             return {'id':cur.lastrowid,**item.model_dump()}
 
+    @router.get('/hl7/sandbox/samples')
+    def get_hl7_samples(_=Depends(require_roles(integration_roles))):
+        """Return pre-configured sample HL7 v2 messages (ADT-A01, ORM-O01, ORU-R01) for testing."""
+        return SAMPLE_MESSAGES
+
+    @router.post('/hl7/sandbox/validate')
+    def validate_hl7_message(item: Hl7MessageCreate, _=Depends(require_roles(integration_roles))):
+        """Parse, validate structure, and extract canonical records without modifying database state."""
+        parsed = parse_raw_hl7(item.raw_payload)
+        validation_errors = validate_hl7_structure(parsed)
+        canonical = extract_canonical_records(parsed)
+        ack = generate_hl7_ack(parsed, accepted=len(validation_errors) == 0, error_msg="; ".join(validation_errors))
+        return {
+            "is_valid": len(validation_errors) == 0,
+            "errors": validation_errors,
+            "parsed": parsed,
+            "canonical_entities": canonical,
+            "simulated_ack": ack,
+        }
+
+    @router.post('/hl7/sandbox/simulate', status_code=201)
+    def simulate_hl7_ingestion(item: Hl7MessageCreate, user=Depends(require_roles(integration_roles))):
+        """Simulate end-to-end HL7 ingestion with reconciliation matching and record creation."""
+        parsed = parse_raw_hl7(item.raw_payload)
+        validation_errors = validate_hl7_structure(parsed)
+        if validation_errors:
+            raise HTTPException(400, detail={"message": "Invalid HL7 structure", "errors": validation_errors})
+
+        canonical = extract_canonical_records(parsed)
+        cid = uuid4().hex
+        ctrl_id = parsed.get("message_control_id", cid[:12])
+        msg_type = parsed.get("message_type", "UNKNOWN")
+
+        with connect() as db:
+            # Check duplicate control ID
+            dup = db.execute("SELECT id FROM integration_events WHERE message_control_id = ?", (ctrl_id,)).fetchone()
+            if dup:
+                raise HTTPException(409, f"Duplicate message control ID '{ctrl_id}' already processed")
+
+            created_records = {}
+            # 1. Process Patient from PID
+            patient_data = canonical.get("patient")
+            patient_id = None
+            if patient_data and patient_data.get("medical_record_number"):
+                mrn = patient_data["medical_record_number"]
+                pat = db.execute("SELECT id FROM patients WHERE medical_record_number = ?", (mrn,)).fetchone()
+                if pat:
+                    patient_id = pat["id"]
+                    created_records["patient"] = {"id": patient_id, "status": "Matched Existing"}
+                else:
+                    cur_p = db.execute(
+                        "INSERT INTO patients (medical_record_number, patient_identifier, display_label, first_name, last_name, date_of_birth, sex, phone, address, created_by) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            mrn,
+                            patient_data.get("patient_identifier"),
+                            patient_data.get("display_label"),
+                            patient_data.get("first_name"),
+                            patient_data.get("last_name"),
+                            patient_data.get("date_of_birth"),
+                            patient_data.get("sex"),
+                            patient_data.get("phone"),
+                            patient_data.get("address"),
+                            user["username"],
+                        ),
+                    )
+                    patient_id = cur_p.lastrowid
+                    created_records["patient"] = {"id": patient_id, "status": "Created New"}
+
+            # 2. Process Accession / Order
+            acc_data = canonical.get("accession")
+            accession_id = None
+            if acc_data and acc_data.get("accession_number"):
+                acc_num = acc_data["accession_number"]
+                existing_acc = db.execute("SELECT id, case_id FROM accessions WHERE accession_number = ?", (acc_num,)).fetchone()
+                if existing_acc:
+                    accession_id = existing_acc["id"]
+                    created_records["accession"] = {"id": accession_id, "status": "Matched Existing"}
+                else:
+                    cur_a = db.execute(
+                        "INSERT INTO accessions (patient_id, accession_number, order_id, priority) VALUES (?, ?, ?, ?)",
+                        (patient_id, acc_num, acc_data.get("order_id"), acc_data.get("priority", "Routine")),
+                    )
+                    accession_id = cur_a.lastrowid
+                    created_records["accession"] = {"id": accession_id, "status": "Created New"}
+
+            # Log Integration Event
+            ack_msg = generate_hl7_ack(parsed, accepted=True)
+            cur_ev = db.execute(
+                "INSERT INTO integration_events (channel_id, correlation_id, message_control_id, message_type, direction, raw_payload, normalized_json, status, acknowledgement, processed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'Processed', ?, SYSUTCDATETIME())",
+                (item.channel_id, cid, ctrl_id, msg_type, item.direction, item.raw_payload, json.dumps(parsed), ack_msg),
+            )
+            db.commit()
+
+        return {
+            "event_id": cur_ev.lastrowid,
+            "correlation_id": cid,
+            "status": "Processed",
+            "message_control_id": ctrl_id,
+            "created_records": created_records,
+            "acknowledgement": ack_msg,
+        }
+
     @router.post('/hl7/messages', status_code=202)
     def receive_hl7(item: Hl7MessageCreate, _=Depends(require_roles(integration_roles))):
-        parsed=_parse_hl7(item.raw_payload); cid=uuid4().hex
+        parsed = parse_raw_hl7(item.raw_payload)
+        cid = uuid4().hex
+        ctrl_id = parsed.get("message_control_id") or cid[:12]
+        msg_type = parsed.get("message_type") or "UNKNOWN"
         with connect() as db:
-            cur=db.execute("INSERT INTO integration_events (channel_id,correlation_id,message_control_id,message_type,direction,raw_payload,normalized_json,status) VALUES (?,?,?,?,?,?,?,'Received')",
-              (item.channel_id,cid,parsed['message_control_id'],parsed['message_type'],item.direction,item.raw_payload,json.dumps(parsed))); db.commit()
-            return {'id':cur.lastrowid,'correlation_id':cid,'status':'Received','parsed':parsed}
+            cur = db.execute(
+                "INSERT INTO integration_events (channel_id,correlation_id,message_control_id,message_type,direction,raw_payload,normalized_json,status) VALUES (?,?,?,?,?,?,?,'Received')",
+                (item.channel_id, cid, ctrl_id, msg_type, item.direction, item.raw_payload, json.dumps(parsed)),
+            )
+            db.commit()
+            return {'id': cur.lastrowid, 'correlation_id': cid, 'status': 'Received', 'parsed': parsed}
 
     @router.get('/hl7/events')
     def events(_=Depends(require_roles(integration_roles))): return _rows(connect, 'SELECT TOP 200 * FROM integration_events ORDER BY id DESC')
@@ -1160,12 +1277,46 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
 
     @router.get('/health')
     def health(request: Request, _=Depends(require_roles(operational_roles))):
-        usage=shutil.disk_usage(uploads_dir); db_ok=True
+        usage = shutil.disk_usage(uploads_dir)
+        db_ok = True
         try:
-            with connect() as db: db.execute('SELECT 1').fetchone()
-        except Exception: db_ok=False
-        return {'ok':db_ok,'database':{'ok':db_ok},'storage':{'path':str(uploads_dir),'total':usage.total,'used':usage.used,'free':usage.free,'used_percent':round(usage.used/usage.total*100,2)},
-                'version':os.getenv('APP_VERSION','development'),'request_id':getattr(request.state,'request_id',None),'time':datetime.now(timezone.utc).isoformat()}
+            with connect() as db:
+                db.execute('SELECT 1').fetchone()
+        except Exception:
+            db_ok = False
+
+        # Live Hardware Telemetry
+        hardware = {}
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            hardware = {
+                'cpu_percent': psutil.cpu_percent(interval=None),
+                'cpu_count_logical': psutil.cpu_count(logical=True),
+                'cpu_count_physical': psutil.cpu_count(logical=False),
+                'memory_total_bytes': vm.total,
+                'memory_used_bytes': vm.used,
+                'memory_free_bytes': vm.available,
+                'memory_used_percent': vm.percent,
+            }
+        except Exception:
+            hardware = {'cpu_percent': 0.0, 'memory_used_percent': 0.0}
+
+        return {
+            'ok': db_ok,
+            'database': {'ok': db_ok},
+            'storage': {
+                'path': str(uploads_dir),
+                'total': usage.total,
+                'used': usage.used,
+                'free': usage.free,
+                'used_percent': round(usage.used / usage.total * 100, 2),
+            },
+            'hardware': hardware,
+            'version': os.getenv('APP_VERSION', 'development'),
+            'request_id': getattr(request.state, 'request_id', None),
+            'time': datetime.now(timezone.utc).isoformat(),
+        }
 
     @router.get('/settings')
     def settings(_=Depends(require_roles(administrators))):
@@ -1200,13 +1351,37 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             if not database: raise RuntimeError('DB_NAME is not configured')
             with connect() as db:
                 db.execute(f"BACKUP DATABASE [{database}] TO DISK=? WITH COPY_ONLY, CHECKSUM, INIT",(str(destination),)); db.commit()
-                manifest={'database':database,'destination':str(destination),'copy_only':True,'checksum':True}
+                manifest={'database':database,'destination':str(destination),'copy_only':True,'checksum':True,'filesize':destination.stat().st_size if destination.exists() else 0}
                 db.execute("UPDATE backup_runs SET status='Completed',manifest_json=?,completed_at=SYSUTCDATETIME() WHERE id=?",(json.dumps(manifest),run_id)); db.commit()
             return {'id':run_id,'correlation_id':cid,'status':'Completed','destination':str(destination)}
         except Exception as exc:
             with connect() as db:
                 db.execute("UPDATE backup_runs SET status='Failed',error_detail=?,completed_at=SYSUTCDATETIME() WHERE id=?",(str(exc)[:4000],run_id)); db.commit()
             raise HTTPException(500,'Backup failed. Verify SQL Server service-account access to BACKUP_DIR.')
+
+    @router.post('/backups/{backup_id}/verify')
+    def verify_backup(backup_id: int, _=Depends(require_roles(administrators))):
+        """Verify physical existence and SQL Server RESTORE VERIFYONLY checksum integrity."""
+        with connect() as db:
+            run = db.execute("SELECT * FROM backup_runs WHERE id = ?", (backup_id,)).fetchone()
+            if not run: raise HTTPException(404, "Backup run not found")
+            destination = Path(run["destination"])
+            if not destination.is_file():
+                db.execute("UPDATE backup_runs SET status='Verification Failed', error_detail='Backup file does not exist on disk' WHERE id=?", (backup_id,))
+                db.commit()
+                return {"id": backup_id, "status": "Verification Failed", "error": "File missing on storage"}
+
+            file_size = destination.stat().st_size
+            try:
+                db.execute("RESTORE VERIFYONLY FROM DISK=?", (str(destination),))
+                db.execute("UPDATE backup_runs SET status='Verified', error_detail=NULL WHERE id=?", (backup_id,))
+                db.commit()
+                return {"id": backup_id, "status": "Verified", "size_bytes": file_size, "integrity": "PASSED"}
+            except Exception as exc:
+                err_msg = str(exc)[:2000]
+                db.execute("UPDATE backup_runs SET status='Verification Failed', error_detail=? WHERE id=?", (err_msg, backup_id))
+                db.commit()
+                return {"id": backup_id, "status": "Verification Failed", "error": err_msg}
 
     @router.get('/retention/preview')
     def retention_preview(days:int=3650,_=Depends(require_roles(administrators))):
@@ -1219,7 +1394,53 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
         return {'retention_days':days,'preview_only':True,'eligible':counts}
 
     @router.get('/audit')
-    def audit_events(_=Depends(require_roles(audit_roles))): return _rows(connect, 'SELECT TOP 500 * FROM audit_log ORDER BY id DESC')
+    def audit_events(
+        actor: str | None = Query(None),
+        action: str | None = Query(None),
+        target_type: str | None = Query(None),
+        target_id: str | None = Query(None),
+        from_date: str | None = Query(None),
+        to_date: str | None = Query(None),
+        limit: int = Query(500, ge=1, le=5000),
+        format: str = Query('json', pattern=r'^(json|csv)$'),
+        _=Depends(require_roles(audit_roles)),
+    ):
+        clauses = []
+        params = []
+        if actor:
+            clauses.append("LOWER(actor_username) = LOWER(?)")
+            params.append(actor.strip())
+        if action:
+            clauses.append("LOWER(action) = LOWER(?)")
+            params.append(action.strip())
+        if target_type:
+            clauses.append("LOWER(target_type) = LOWER(?)")
+            params.append(target_type.strip())
+        if target_id:
+            clauses.append("target_id = ?")
+            params.append(target_id.strip())
+        if from_date:
+            clauses.append("created_at >= ?")
+            params.append(from_date.strip())
+        if to_date:
+            clauses.append("created_at <= ?")
+            params.append(to_date.strip())
+
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT TOP ({limit}) * FROM audit_log{where} ORDER BY id DESC"
+        rows = _rows(connect, sql, tuple(params))
+
+        if format == 'csv':
+            import csv
+            from io import StringIO
+            output = StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["id", "created_at", "actor_username", "action", "target_type", "target_id", "details", "ip_address", "device_name", "user_agent"])
+            for r in rows:
+                writer.writerow([r.get("id"), r.get("created_at"), r.get("actor_username"), r.get("action"), r.get("target_type"), r.get("target_id"), r.get("details"), r.get("ip_address"), r.get("device_name"), r.get("user_agent")])
+            return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=audit_export.csv"})
+
+        return rows
     return router
 
 
