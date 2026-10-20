@@ -749,29 +749,8 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}/report.pdf")
     def download_ai_report_pdf(
         analysis_id: int,
-        request: Request,
-        token: str | None = None,
+        current_user: dict = Depends(require_roles_func(ai_read_roles)),
     ):
-        # Authenticate via either header/cookie or query token
-        auth_token = token or request.cookies.get("access_token")
-        if not auth_token:
-            auth_header = request.headers.get("Authorization")
-            if auth_header and auth_header.startswith("Bearer "):
-                auth_token = auth_header.split(" ")[1]
-
-        if auth_token:
-            try:
-                import jwt
-                from main import SECRET_KEY, ALGORITHM
-                jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
-            except Exception:
-                raise HTTPException(401, "Invalid or expired authentication token")
-        else:
-            try:
-                get_current_user_func(request)
-            except Exception:
-                raise HTTPException(401, "Authentication required to download AI report")
-
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
             case_row = get_case_func(row["case_id"])

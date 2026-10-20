@@ -3,7 +3,8 @@
 import getpass
 from contextlib import closing
 
-from main import connect, get_password_hash, validate_password
+from core.database import connect
+from core.security import get_password_hash, validate_password
 
 
 def main():

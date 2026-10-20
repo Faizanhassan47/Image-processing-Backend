@@ -4,7 +4,8 @@ import getpass
 import os
 from contextlib import closing
 
-from main import connect, get_password_hash
+from core.database import connect
+from core.security import get_password_hash
 
 
 PROTECTED_ADMIN_USERS = (
