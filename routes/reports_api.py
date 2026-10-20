@@ -163,12 +163,15 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
         return serialize_report(row)
 
     @router.get("/api/reports/{report_id}/pdf", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def export_report_pdf(report_id: int):
+    def export_report_pdf(report_id: int, current_user: dict = Depends(get_current_user)):
         with closing(connect()) as db:
             report = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
             if not report:
                 raise HTTPException(404, "Report not found")
-            case = db.execute("SELECT case_id FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            case = db.execute("SELECT * FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            if not case:
+                raise HTTPException(404, "Case not found")
+            require_assigned_case_fn(case, current_user)
             findings = db.execute("SELECT * FROM report_findings WHERE report_id = ? ORDER BY sort_order", (report_id,)).fetchall()
 
         pdf = FPDF()
@@ -216,12 +219,15 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
         })
 
     @router.get("/api/reports/{report_id}/csv", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def export_report_csv(report_id: int):
+    def export_report_csv(report_id: int, current_user: dict = Depends(get_current_user)):
         with closing(connect()) as db:
             report = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
             if not report:
                 raise HTTPException(404, "Report not found")
-            case = db.execute("SELECT case_id FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            case = db.execute("SELECT * FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            if not case:
+                raise HTTPException(404, "Case not found")
+            require_assigned_case_fn(case, current_user)
             findings = db.execute("SELECT * FROM report_findings WHERE report_id = ? ORDER BY sort_order", (report_id,)).fetchall()
 
         output = StringIO()
@@ -240,12 +246,15 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
         return Response(output.getvalue(), media_type="text/csv", headers={"Content-Disposition": f"attachment; filename=report_{case['case_id']}_v{report['version']}.csv"})
 
     @router.get("/api/reports/{report_id}/html", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
-    def export_report_html(report_id: int):
+    def export_report_html(report_id: int, current_user: dict = Depends(get_current_user)):
         with closing(connect()) as db:
             report = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
             if not report:
                 raise HTTPException(404, "Report not found")
-            case = db.execute("SELECT case_id FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            case = db.execute("SELECT * FROM cases WHERE id = ?", (report["case_id"],)).fetchone()
+            if not case:
+                raise HTTPException(404, "Case not found")
+            require_assigned_case_fn(case, current_user)
 
         sections = "".join(f"<section><h2>{html.escape(label)}</h2><p>{html.escape(str(report[key] or ''))}</p></section>" for key, label in (
             ("specimen_clinical", "Specimen and clinical"),

@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import mimetypes
 import re
+import shutil
 from uuid import uuid4
 
 import pyodbc
@@ -47,6 +48,8 @@ def _valid_cnic(value):
 
 
 DDL = [
+    '''DECLARE @external_constraint SYSNAME, @external_sql NVARCHAR(4000); SELECT TOP (1) @external_constraint=kc.name FROM sys.key_constraints kc JOIN sys.index_columns ic ON ic.object_id=kc.parent_object_id AND ic.index_id=kc.unique_index_id JOIN sys.columns c ON c.object_id=ic.object_id AND c.column_id=ic.column_id WHERE kc.parent_object_id=OBJECT_ID('patients') AND kc.type='UQ' GROUP BY kc.name HAVING COUNT(*)=1 AND MAX(c.name)='external_id'; IF @external_constraint IS NOT NULL BEGIN SET @external_sql=N'ALTER TABLE patients DROP CONSTRAINT ' + QUOTENAME(@external_constraint); EXEC sp_executesql @external_sql; END''',
+    '''IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_external' AND object_id=OBJECT_ID('patients')) CREATE UNIQUE INDEX UQ_patients_external ON patients(external_id) WHERE external_id IS NOT NULL''',
     "IF COL_LENGTH('patients','cnic') IS NULL ALTER TABLE patients ADD cnic CHAR(13) NULL",
     "IF COL_LENGTH('patients','patient_identifier') IS NULL ALTER TABLE patients ADD patient_identifier VARCHAR(64) NULL",
     "IF COL_LENGTH('patients','medical_record_number') IS NULL ALTER TABLE patients ADD medical_record_number VARCHAR(120) NULL",
@@ -391,6 +394,17 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                 db.commit()
             except pyodbc.IntegrityError:
                 db.rollback()
+                conflict_checks = [
+                    ('cnic', item.cnic, 'A patient with this CNIC already exists'),
+                    ('medical_record_number', item.medical_record_number, 'A patient with this medical record number already exists'),
+                    ('external_id', item.external_id, 'A patient with this external identifier already exists'),
+                    ('patient_identifier', item.patient_identifier, 'A patient with this patient identifier already exists'),
+                ]
+                for column, value, message in conflict_checks:
+                    if value:
+                        duplicate = db.execute(f'SELECT id FROM patients WHERE {column}=?', (value,)).fetchone()
+                        if duplicate:
+                            raise HTTPException(409, detail={'message': message, 'patient_id': duplicate['id']})
                 raise HTTPException(409, "Patient identifier already exists")
             row = db.execute("SELECT * FROM patients WHERE id=?", (patient_id,)).fetchone()
         return _serialize_patient(row)
@@ -432,13 +446,77 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
             return _serialize_patient(db.execute("SELECT * FROM patients WHERE id=?", (patient_id,)).fetchone())
 
     @router.delete("/{patient_id}")
-    def delete_patient(patient_id: int, user=Depends(require_roles(ADMIN_ROLES))):
+    def delete_patient(patient_id: int, cascade_cases: bool = Query(True), user=Depends(require_roles(ADMIN_ROLES))):
+        filenames = []
         with connect() as db:
             patient = _patient_or_404(db, patient_id)
             if bool(patient.get("legal_hold")):
                 raise HTTPException(400, "Cannot delete patient record under active legal hold")
-            # Unlink accessions so cases are preserved
-            db.execute("UPDATE accessions SET patient_id=NULL WHERE patient_id=?", (patient_id,))
+            
+            # Find all linked cases
+            linked_cases = db.execute("SELECT DISTINCT case_id FROM accessions WHERE patient_id=? AND case_id IS NOT NULL", (patient_id,)).fetchall()
+            case_ids = [row["case_id"] for row in linked_cases if row.get("case_id")]
+
+            if cascade_cases and case_ids:
+                for case_id in case_ids:
+                    case = db.execute("SELECT id, case_id, filename, status FROM cases WHERE id=?", (case_id,)).fetchone()
+                    if not case:
+                        continue
+                    if case.get("filename"):
+                        filenames.append(case["filename"])
+                    slides = db.execute("SELECT id, filename FROM slides WHERE case_id=?", (case_id,)).fetchall()
+                    slide_ids = [row["id"] for row in slides]
+                    filenames.extend(row["filename"] for row in slides if row.get("filename"))
+                    if slide_ids:
+                        slide_marks = ",".join("?" for _ in slide_ids)
+                        versions = db.execute(f"SELECT id, stored_filename FROM image_versions WHERE slide_id IN ({slide_marks})", tuple(slide_ids)).fetchall()
+                        filenames.extend(row["stored_filename"] for row in versions if row.get("stored_filename"))
+                        version_ids = [row["id"] for row in versions]
+                        db.execute(f"UPDATE report_findings SET annotation_id=NULL WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id IN ({slide_marks}))", tuple(slide_ids))
+                        db.execute(f"DELETE FROM annotation_revisions WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id IN ({slide_marks}))", tuple(slide_ids))
+                        db.execute(f"DELETE FROM annotations WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"UPDATE annotations SET source_ai_result_id=NULL WHERE source_ai_result_id IN (SELECT r.id FROM ai_results r JOIN ai_jobs j ON j.id=r.ai_job_id WHERE j.slide_id IN ({slide_marks}))", tuple(slide_ids))
+                        db.execute(f"DELETE FROM ai_results WHERE ai_job_id IN (SELECT id FROM ai_jobs WHERE slide_id IN ({slide_marks}))", tuple(slide_ids))
+                        db.execute(f"DELETE FROM ai_jobs WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        try:
+                            db.execute(f"DELETE FROM ai_analyses WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        except Exception:
+                            pass
+                        if version_ids:
+                            version_marks = ",".join("?" for _ in version_ids)
+                            db.execute(f"UPDATE annotations SET image_version_id=NULL WHERE image_version_id IN ({version_marks})", tuple(version_ids))
+                            db.execute(f"DELETE FROM image_metadata_revisions WHERE image_version_id IN ({version_marks})", tuple(version_ids))
+                        db.execute(f"DELETE FROM viewer_bookmarks WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"DELETE FROM viewer_preferences WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"DELETE FROM slide_qc_history WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"DELETE FROM image_versions WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"DELETE FROM slides WHERE id IN ({slide_marks})", tuple(slide_ids))
+                    try:
+                        db.execute("DELETE FROM ai_analyses WHERE case_id=?", (case_id,))
+                    except Exception:
+                        pass
+                    db.execute("DELETE FROM report_findings WHERE report_id IN (SELECT id FROM reports WHERE case_id=?)", (case_id,))
+                    db.execute("DELETE FROM report_reviews WHERE report_id IN (SELECT id FROM reports WHERE case_id=?)", (case_id,))
+                    db.execute("DELETE FROM reports WHERE case_id=?", (case_id,))
+                    db.execute("DELETE FROM case_review_notes WHERE case_id=?", (case_id,))
+                    db.execute("DELETE FROM case_review_history WHERE case_id=?", (case_id,))
+                    db.execute("DELETE FROM case_consultations WHERE case_id=?", (case_id,))
+                    db.execute("DELETE FROM research_folder_members WHERE case_id=?", (case_id,))
+                    db.execute("DELETE FROM case_links WHERE case_id=? OR related_case_id=?", (case_id, case_id))
+                    db.execute("DELETE FROM case_operations WHERE source_case_id=? OR target_case_id=?", (case_id, case_id))
+                    db.execute("DELETE FROM accessions WHERE case_id=?", (case_id,))
+                    db.execute("UPDATE ingestion_jobs SET matched_case_id=NULL WHERE matched_case_id=?", (case_id,))
+                    db.execute("UPDATE reconciliation_items SET resolved_case_id=NULL WHERE resolved_case_id=?", (case_id,))
+                    db.execute("DELETE FROM cases WHERE id=?", (case_id,))
+                    db.execute("INSERT INTO audit_log (actor_username,action,target_type,target_id,details) VALUES (?,?,?,?,?)",
+                               (user["username"], "case.delete", "case", str(case_id), json.dumps({"cascade_patient_id": patient_id, "case_code": case.get("case_id")})))
+            else:
+                # Unlink accessions so cases are preserved if cascade is false
+                db.execute("UPDATE accessions SET patient_id=NULL WHERE patient_id=?", (patient_id,))
+
+            # Clean up unlinked accessions belonging directly to this patient
+            db.execute("DELETE FROM accessions WHERE patient_id=?", (patient_id,))
+
             # Remove associated child clinical and longitudinal data
             for child_table in (
                 "patient_test_results",
@@ -464,9 +542,26 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                 if db.execute("SELECT OBJECT_ID(?, 'U') AS id", (direct_table,)).fetchone()["id"]:
                     db.execute(f"DELETE FROM {direct_table} WHERE patient_id=?", (patient_id,))
             db.execute("DELETE FROM patients WHERE id=?", (patient_id,))
-            audit(db, user["username"], "patient.delete", "patient", patient_id, json.dumps({"patient_identifier": patient.get("patient_identifier")}))
+            audit(db, user["username"], "patient.delete", "patient", patient_id, json.dumps({"patient_identifier": patient.get("patient_identifier"), "cascaded_cases": len(case_ids) if cascade_cases else 0}))
             db.commit()
-            return {"message": "Patient profile deleted successfully", "patient_id": patient_id}
+
+        if filenames:
+            deleted_dir = (uploads_dir / "_deleted_cases").resolve()
+            deleted_dir.mkdir(parents=True, exist_ok=True)
+            upload_root = uploads_dir.resolve()
+            for filename in set(filenames):
+                source = (uploads_dir / filename).resolve()
+                if upload_root not in source.parents or not source.is_file():
+                    continue
+                try:
+                    destination = deleted_dir / f"patient_{patient_id}_{source.name}"
+                    if destination.exists():
+                        destination = deleted_dir / f"patient_{patient_id}_{uuid4().hex}_{source.name}"
+                    shutil.move(str(source), str(destination))
+                except OSError:
+                    pass
+
+        return {"message": "Patient profile deleted successfully", "patient_id": patient_id}
 
     @router.get("/{patient_id}/medical-history")
     def medical_history(patient_id: int, _=Depends(require_roles(READ_ROLES))):

@@ -55,7 +55,7 @@ IF OBJECT_ID('dbo.patients', 'U') IS NULL
 CREATE TABLE dbo.patients (
     id                      INT IDENTITY(1,1) NOT NULL CONSTRAINT PK_patients PRIMARY KEY,
     patient_identifier      VARCHAR(64) NULL CONSTRAINT UQ_patients_identifier UNIQUE,
-    external_id             VARCHAR(255) NULL CONSTRAINT UQ_patients_external UNIQUE,
+    external_id             VARCHAR(255) NULL,
     medical_record_number   VARCHAR(120) NULL,
     cnic                    CHAR(13) NULL,
     display_label           NVARCHAR(255) NOT NULL,
@@ -602,6 +602,9 @@ IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_audit_log_created_at' A
     CREATE INDEX idx_audit_log_created_at ON dbo.audit_log(created_at DESC);
 
 -- Clinical Hierarchy & Cases
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UQ_patients_external' AND object_id=OBJECT_ID('dbo.patients'))
+    CREATE UNIQUE INDEX UQ_patients_external ON dbo.patients(external_id) WHERE external_id IS NOT NULL;
+
 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='idx_accessions_case_identifiers' AND object_id=OBJECT_ID('dbo.accessions'))
     CREATE INDEX idx_accessions_case_identifiers ON dbo.accessions(case_id, accession_number, order_id);
 
