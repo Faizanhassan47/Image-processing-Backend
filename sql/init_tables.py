@@ -31,7 +31,88 @@ def init_db(connect_fn):
                 db.execute("ALTER TABLE users DROP COLUMN password")
             except pyodbc.Error:
                 pass
+        if 'is_premium' not in user_columns:
+            db.execute("ALTER TABLE users ADD is_premium BIT NOT NULL CONSTRAINT DF_users_is_premium DEFAULT 0")
         db.execute("UPDATE users SET username = 'ETDadmin' WHERE LOWER(username) = 'eidadmin' AND NOT EXISTS (SELECT 1 FROM users WHERE LOWER(username) = 'etdadmin')")
+
+        db.execute("""
+            IF OBJECT_ID('ai_features','U') IS NULL
+            CREATE TABLE ai_features (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                feature_code VARCHAR(64) NOT NULL UNIQUE,
+                feature_name VARCHAR(120) NOT NULL,
+                description VARCHAR(1000) NOT NULL,
+                is_implemented BIT NOT NULL CONSTRAINT DF_ai_features_implemented DEFAULT 0,
+                is_active BIT NOT NULL CONSTRAINT DF_ai_features_active DEFAULT 1,
+                created_at DATETIME2 NOT NULL CONSTRAINT DF_ai_features_created DEFAULT SYSUTCDATETIME()
+            )
+        """)
+        feature_seeds = [
+            ('HOVERNET', 'HoVer-Net', 'Detects and segments cell nuclei, classifies nuclear types, and provides counts, density, and morphology measurements.', 1),
+            ('IMAGE_QC', 'Image Quality Control', 'Evaluates image quality, including blur, focus problems, tissue folds, and artifacts.', 0),
+            ('TUMOR_DETECTION', 'Tumor Detection', 'Identifies candidate tumor-containing regions for research review.', 0),
+            ('TISSUE_SEGMENTATION', 'Tissue Segmentation', 'Identifies tissue structures and regions, such as stroma and epithelium, when supported by an appropriate model.', 0),
+        ]
+        for code, name, description, implemented in feature_seeds:
+            db.execute("""IF NOT EXISTS (SELECT 1 FROM ai_features WHERE feature_code=?)
+                INSERT INTO ai_features (feature_code,feature_name,description,is_implemented,is_active)
+                VALUES (?,?,?,?,1)""", (code, code, name, description, implemented))
+        for column_name, definition in {
+            "catalog_category": "NVARCHAR(80) NULL",
+            "catalog_summary": "NVARCHAR(500) NULL",
+            "catalog_purpose": "NVARCHAR(1000) NULL",
+            "catalog_value": "NVARCHAR(1000) NULL",
+            "catalog_outputs_json": "NVARCHAR(MAX) NULL",
+            "is_catalog_visible": "BIT NOT NULL CONSTRAINT DF_ai_features_catalog_visible DEFAULT 1",
+            "is_featured": "BIT NOT NULL CONSTRAINT DF_ai_features_featured DEFAULT 0",
+            "catalog_title": "NVARCHAR(160) NULL",
+            "catalog_display_order": "INT NOT NULL CONSTRAINT DF_ai_features_catalog_display_order DEFAULT 0",
+            "is_catalog_deleted": "BIT NOT NULL CONSTRAINT DF_ai_features_catalog_deleted DEFAULT 0",
+            "catalog_session_price_usd": "DECIMAL(12,2) NULL",
+            "catalog_usd_to_pkr_rate": "DECIMAL(12,4) NULL",
+            "catalog_session_price_pkr": "DECIMAL(14,2) NULL",
+        }.items():
+            db.execute(f"IF COL_LENGTH('ai_features','{column_name}') IS NULL ALTER TABLE ai_features ADD {column_name} {definition}")
+        db.execute("""
+            IF OBJECT_ID('user_subscriptions','U') IS NULL
+            CREATE TABLE user_subscriptions (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id),
+                plan_name VARCHAR(120) NOT NULL,
+                start_date DATETIME2 NOT NULL,
+                end_date DATETIME2 NOT NULL,
+                status VARCHAR(20) NOT NULL CONSTRAINT CK_user_subscriptions_status CHECK (status IN ('Active','Expired','Cancelled','Suspended')),
+                created_by VARCHAR(255) NOT NULL,
+                created_at DATETIME2 NOT NULL CONSTRAINT DF_user_subscriptions_created DEFAULT SYSUTCDATETIME(),
+                updated_at DATETIME2 NOT NULL CONSTRAINT DF_user_subscriptions_updated DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT CK_user_subscriptions_dates CHECK (end_date > start_date)
+            )
+        """)
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='UX_user_subscriptions_one_active' AND object_id=OBJECT_ID('user_subscriptions')) CREATE UNIQUE INDEX UX_user_subscriptions_one_active ON user_subscriptions(user_id) WHERE status='Active'")
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_user_subscriptions_user_dates' AND object_id=OBJECT_ID('user_subscriptions')) CREATE INDEX IX_user_subscriptions_user_dates ON user_subscriptions(user_id,status,start_date,end_date)")
+        db.execute("""
+            IF OBJECT_ID('user_subscription_features','U') IS NULL
+            CREATE TABLE user_subscription_features (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                subscription_id INT NOT NULL REFERENCES user_subscriptions(id) ON DELETE CASCADE,
+                feature_id INT NOT NULL REFERENCES ai_features(id),
+                is_enabled BIT NOT NULL CONSTRAINT DF_user_subscription_features_enabled DEFAULT 1,
+                granted_at DATETIME2 NOT NULL CONSTRAINT DF_user_subscription_features_granted DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT UQ_user_subscription_features UNIQUE (subscription_id,feature_id)
+            )
+        """)
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_user_subscription_features_lookup' AND object_id=OBJECT_ID('user_subscription_features')) CREATE INDEX IX_user_subscription_features_lookup ON user_subscription_features(feature_id,subscription_id,is_enabled)")
+        db.execute("""
+            IF OBJECT_ID('user_ai_feature_preferences','U') IS NULL
+            CREATE TABLE user_ai_feature_preferences (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                feature_id INT NOT NULL REFERENCES ai_features(id) ON DELETE CASCADE,
+                is_enabled BIT NOT NULL CONSTRAINT DF_user_ai_feature_preferences_enabled DEFAULT 1,
+                updated_at DATETIME2 NOT NULL CONSTRAINT DF_user_ai_feature_preferences_updated DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT UQ_user_ai_feature_preferences UNIQUE (user_id,feature_id)
+            )
+        """)
             
         db.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='cases' and xtype='U')
@@ -249,8 +330,12 @@ def init_db(connect_fn):
         db.execute("IF EXISTS (SELECT 1 FROM sys.check_constraints WHERE name='CK_users_super_admin_reserved') ALTER TABLE users DROP CONSTRAINT CK_users_super_admin_reserved")
         db.execute("UPDATE users SET role='Laboratory Manager', is_active=0 WHERE role IN ('Technician','Histotechnologist','Viewer','Auditor','AI Analyst','Integration Engineer')")
         db.execute("UPDATE users SET role='System Administrator' WHERE role='Admin'")
-        db.execute("UPDATE users SET role='System Administrator', is_active=1 WHERE LOWER(username) IN ('etddev','etdadmin')")
-        db.execute("ALTER TABLE users ADD CONSTRAINT CK_users_approved_roles CHECK (role IN ('System Administrator','Laboratory Manager','Pathologist'))")
+        db.execute("UPDATE users SET role='Super Administrator', is_active=1 WHERE LOWER(username) IN ('etddev','etdadmin')")
+        db.execute("ALTER TABLE users ADD CONSTRAINT CK_users_approved_roles CHECK (role IN ('Super Administrator','System Administrator','Laboratory Manager','Pathologist'))")
+        db.execute("""IF OBJECT_ID('dbo.TR_users_max_two_super_administrators','TR') IS NULL
+            EXEC('CREATE TRIGGER dbo.TR_users_max_two_super_administrators ON dbo.users AFTER INSERT, UPDATE AS
+            BEGIN SET NOCOUNT ON; IF (SELECT COUNT(*) FROM dbo.users WITH (UPDLOCK,HOLDLOCK) WHERE role=''''Super Administrator'''') > 2
+            BEGIN ROLLBACK TRANSACTION; THROW 51001, ''''A maximum of two Super Administrators is allowed.'''', 1; END END')""")
 
         db.execute("""
             IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='report_findings' and xtype='U')

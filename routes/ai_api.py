@@ -16,7 +16,7 @@ import time
 import uuid
 
 import openslide
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
@@ -43,6 +43,7 @@ from services.ai_engine import (
     summarize_classification_scores,
     validate_roi_dimensions,
 )
+from services.ai_subscription_service import AISubscriptionService, HOVERNET
 
 logger = logging.getLogger("pathology.ai_api")
 
@@ -61,10 +62,22 @@ class AIAnalysisRequest(BaseModel):
     run_in_background: bool | None = None
 
 
-def create_ai_router(connect_func, require_roles_func, get_current_user_func, get_slide_func, get_case_func, stored_path_func):
+def create_ai_router(connect_func, require_roles_func, get_current_user_func, get_slide_func, get_case_func, stored_path_func, require_assigned_case_func):
     from core import AI_READ_ROLES as ai_read_roles, AI_RUN_ROLES as ai_run_roles
 
     router = APIRouter(tags=["AI Analysis"])
+    subscriptions = AISubscriptionService(connect_func)
+
+    def _authorized_slide(slide_id, current_user):
+        slide_row = get_slide_func(slide_id)
+        case_row = get_case_func(slide_row["case_id"])
+        require_assigned_case_func(case_row, current_user)
+        return slide_row, case_row
+
+    def _authorize_analysis(row, current_user):
+        case_row = get_case_func(row["case_id"])
+        require_assigned_case_func(case_row, current_user)
+        return case_row
 
 
     def _get_analysis_row(db, analysis_id: int):
@@ -335,9 +348,9 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         x: int | None = None,
         y: int | None = None,
         level: int = 0,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
-        slide_row = get_slide_func(slide_id)
+        slide_row, _ = _authorized_slide(slide_id, current_user)
         slide_path = stored_path_func(slide_row["filename"])
         slide = openslide.OpenSlide(str(slide_path))
         try:
@@ -361,11 +374,13 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/jobs/{job_id}")
     def get_ai_job_progress(
         job_id: str,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
         job = ai_job_manager.get_job(job_id)
         if not job:
             raise HTTPException(404, f"AI Job '{job_id}' not found.")
+        case_row = get_case_func(job.case_id)
+        require_assigned_case_func(case_row, current_user)
         return job.to_dict()
 
     @router.post("/api/ai/jobs/{job_id}/cancel")
@@ -376,6 +391,10 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         job = ai_job_manager.get_job(job_id)
         if not job:
             raise HTTPException(404, f"AI Job '{job_id}' not found.")
+        case_row = get_case_func(job.case_id)
+        require_assigned_case_func(case_row, current_user)
+        if current_user["role"] == "Pathologist" and job.requested_by.casefold() != current_user["username"].casefold():
+            raise HTTPException(403, "Pathologists may cancel only their own AI jobs")
         success = ai_job_manager.cancel_job(job_id)
         return {"job_id": job_id, "cancelled": success, "status": job.status}
 
@@ -386,8 +405,8 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         response: Response,
         current_user: dict = Depends(require_roles_func(ai_run_roles)),
     ):
-        slide_row = get_slide_func(slide_id)
-        case_row = get_case_func(slide_row["case_id"])
+        slide_row, case_row = _authorized_slide(slide_id, current_user)
+        subscriptions.require_entitlement(current_user, HOVERNET)
 
         slide_path = stored_path_func(slide_row["filename"])
         if not slide_path.is_file():
@@ -512,9 +531,9 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/slides/{slide_id}/ai/analyses")
     def list_slide_ai_analyses(
         slide_id: int,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
-        get_slide_func(slide_id)
+        _authorized_slide(slide_id, current_user)
         with closing(connect_func()) as db:
             rows = db.execute(
                 """SELECT id, slide_id, case_id, requested_by, model_name, model_version, status,
@@ -567,10 +586,11 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}")
     def get_ai_analysis_details(
         analysis_id: int,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
+        _authorize_analysis(row, current_user)
 
         d = dict(row)
         summary = json.loads(d.pop("summary_json") or "{}")
@@ -638,10 +658,11 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}/roi.png")
     def get_analysis_roi_image(
         analysis_id: int,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
+        _authorize_analysis(row, current_user)
 
         filename = row.get("roi_image_filename")
         if not filename:
@@ -656,10 +677,11 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}/overlay.png")
     def get_analysis_overlay_image(
         analysis_id: int,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
+        _authorize_analysis(row, current_user)
 
         filename = row.get("overlay_image_filename")
         if not filename:
@@ -675,13 +697,14 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     def get_analysis_gallery_crop(
         analysis_id: int,
         filename: str,
-        _=Depends(require_roles_func(ai_read_roles)),
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
         if not re.fullmatch(r"type_[0-5]_[0-9]{2}\.png", filename):
             raise HTTPException(400, "Invalid crop thumbnail identifier")
 
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
+        _authorize_analysis(row, current_user)
 
         gallery = json.loads(row.get("gallery_json") or "{}")
         gallery_id = gallery.get("gallery_id")
@@ -701,7 +724,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     ):
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
-            case_row = get_case_func(row["case_id"])
+            case_row = _authorize_analysis(row, current_user)
 
         summary = json.loads(row.get("summary_json") or "{}")
         gallery = json.loads(row.get("gallery_json") or "{}")
@@ -749,32 +772,11 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}/report.pdf")
     def download_ai_report_pdf(
         analysis_id: int,
-        request: Request,
-        token: str | None = None,
+        current_user=Depends(require_roles_func(ai_read_roles)),
     ):
-        # Authenticate via either header/cookie or query token
-        auth_token = token or request.cookies.get("access_token")
-        if not auth_token:
-            auth_header = request.headers.get("Authorization")
-            if auth_header and auth_header.startswith("Bearer "):
-                auth_token = auth_header.split(" ")[1]
-
-        if auth_token:
-            try:
-                import jwt
-                from main import SECRET_KEY, ALGORITHM
-                jwt.decode(auth_token, SECRET_KEY, algorithms=[ALGORITHM])
-            except Exception:
-                raise HTTPException(401, "Invalid or expired authentication token")
-        else:
-            try:
-                get_current_user_func(request)
-            except Exception:
-                raise HTTPException(401, "Authentication required to download AI report")
-
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
-            case_row = get_case_func(row["case_id"])
+            case_row = _authorize_analysis(row, current_user)
 
         filename = row.get("report_pdf_filename")
         if not filename or not (AI_REPORT_DIR / filename).is_file():

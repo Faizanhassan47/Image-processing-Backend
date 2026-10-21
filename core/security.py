@@ -24,21 +24,22 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # =====================================================================
 
 ROLE_ADMIN = "System Administrator"
+ROLE_SUPER_ADMIN = "Super Administrator"
 ROLE_LAB_MANAGER = "Laboratory Manager"
 ROLE_PATHOLOGIST = "Pathologist"
 ROLE_AUDITOR = "Auditor"
 
 # All valid individual roles in the system
 USER_ROLES = {
+    ROLE_SUPER_ADMIN,
     ROLE_ADMIN,
     ROLE_LAB_MANAGER,
     ROLE_PATHOLOGIST,
-    ROLE_AUDITOR,
 }
 ASSIGNABLE_USER_ROLES = USER_ROLES
 
 # Predefined role permission groups (used across routes & services)
-ADMIN_ROLES = [ROLE_ADMIN]
+ADMIN_ROLES = [ROLE_ADMIN, ROLE_SUPER_ADMIN]
 INTAKE_ROLES = [ROLE_ADMIN, ROLE_LAB_MANAGER]
 CLINICAL_WRITE_ROLES = [ROLE_ADMIN, ROLE_LAB_MANAGER]
 CLINICAL_READ_ROLES = [ROLE_ADMIN, ROLE_LAB_MANAGER, ROLE_PATHOLOGIST, ROLE_AUDITOR]

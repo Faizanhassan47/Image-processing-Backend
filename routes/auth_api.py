@@ -40,9 +40,21 @@ class UserCreate(BaseModel):
     role: str
 
 
+class UserStatusUpdate(BaseModel):
+    is_active: bool
+
+
 def create_auth_router(connect, require_roles, get_current_user, audit):
     router = APIRouter()
     login_attempts = defaultdict(deque)
+
+    def is_super_admin(user):
+        return user.get("role") == "Super Administrator" or is_protected_super_admin(user.get("username"))
+
+    def allowed_managed_roles(user):
+        if is_super_admin(user):
+            return set(ASSIGNABLE_USER_ROLES)
+        return {"Laboratory Manager", "Pathologist"}
 
     # --- Authentication Endpoints ---
 
@@ -122,9 +134,10 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
     @router.get("/api/users")
     def get_users(current_user: dict = Depends(require_roles(ADMIN_ROLES))):
         with closing(connect()) as db:
-            users = db.execute(
-                "SELECT id, username, display_name, role, is_active, created_at, last_login FROM users"
-            ).fetchall()
+            query = "SELECT id, username, display_name, role, is_active, is_premium, created_at, last_login FROM users"
+            if not is_super_admin(current_user):
+                query += " WHERE role <> 'Super Administrator' AND LOWER(username) NOT IN ('etddev', 'etdadmin')"
+            users = db.execute(query).fetchall()
             return [dict(u) for u in users]
 
     @router.post("/api/users")
@@ -134,10 +147,14 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
                 status_code=403,
                 detail="Reserved protected-administrator usernames cannot be created through user management",
             )
-        if user.role not in ASSIGNABLE_USER_ROLES:
-            raise HTTPException(status_code=400, detail="Invalid or protected role")
+        if user.role not in allowed_managed_roles(current_user):
+            raise HTTPException(status_code=403, detail="You cannot create an account with this role")
         validate_password(user.password)
         with closing(connect()) as db:
+            if user.role == "Super Administrator":
+                count = db.execute("SELECT COUNT(*) AS count FROM users WITH (UPDLOCK,HOLDLOCK) WHERE role='Super Administrator'").fetchone()["count"]
+                if count >= 2:
+                    raise HTTPException(status_code=409, detail="A maximum of two Super Administrators is allowed")
             existing = db.execute("SELECT id FROM users WHERE username = ?", (user.username,)).fetchone()
             if existing:
                 raise HTTPException(status_code=400, detail="Username already exists")
@@ -162,11 +179,13 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
     @router.delete("/api/users/{user_id}")
     def delete_user(user_id: int, current_user: dict = Depends(require_roles(ADMIN_ROLES))):
         with closing(connect()) as db:
-            target = db.execute("SELECT id, username FROM users WHERE id = ?", (user_id,)).fetchone()
+            target = db.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,)).fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
-            if is_protected_super_admin(target["username"]):
-                raise HTTPException(status_code=403, detail="Protected System Administrator accounts cannot be deleted")
+            if target["id"] == current_user["id"]:
+                raise HTTPException(status_code=400, detail="You cannot delete your own account")
+            if target["role"] in {"Super Administrator", "System Administrator"} and not is_super_admin(current_user):
+                raise HTTPException(status_code=403, detail="Only a Super Administrator may delete administrator accounts")
 
             count_row = db.execute("SELECT COUNT(*) as cnt FROM users").fetchone()
             if count_row and count_row["cnt"] <= 1:
@@ -179,14 +198,21 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
 
     @router.patch("/api/users/{user_id}/role")
     def update_user_role(user_id: int, change: dict, current_user: dict = Depends(require_roles(ADMIN_ROLES))):
-        if change.get("role") not in ASSIGNABLE_USER_ROLES:
-            raise HTTPException(status_code=400, detail="Invalid or protected role")
+        requested_role = change.get("role")
+        if requested_role not in allowed_managed_roles(current_user):
+            raise HTTPException(status_code=403, detail="You cannot assign this role")
         with closing(connect()) as db:
             target = db.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,)).fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
-            if is_protected_super_admin(target["username"]):
-                raise HTTPException(status_code=403, detail="Protected System Administrator roles cannot be changed")
+            if target["id"] == current_user["id"]:
+                raise HTTPException(status_code=400, detail="You cannot change your own role")
+            if target["role"] in {"Super Administrator", "System Administrator"} and not is_super_admin(current_user):
+                raise HTTPException(status_code=403, detail="Only a Super Administrator may change administrator roles")
+            if requested_role == "Super Administrator" and target["role"] != "Super Administrator":
+                count = db.execute("SELECT COUNT(*) AS count FROM users WITH (UPDLOCK,HOLDLOCK) WHERE role='Super Administrator'").fetchone()["count"]
+                if count >= 2:
+                    raise HTTPException(status_code=409, detail="A maximum of two Super Administrators is allowed")
 
             if target["role"] == "System Administrator" and change["role"] != "System Administrator":
                 count_row = db.execute(
@@ -195,19 +221,38 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
                 if count_row and count_row["cnt"] <= 1:
                     raise HTTPException(status_code=400, detail="Cannot demote the last System Administrator")
 
-            db.execute("UPDATE users SET role = ? WHERE id = ?", (change["role"], user_id))
-            audit(db, current_user["username"], "user.role_change", "user", user_id, change["role"])
+            db.execute("UPDATE users SET role = ? WHERE id = ?", (requested_role, user_id))
+            audit(db, current_user["username"], "user.role_change", "user", user_id, requested_role)
             db.commit()
-        return {"message": "Role updated"}
+        return {"message": "Role updated", "role": requested_role}
+
+    @router.patch("/api/users/{user_id}/status")
+    def update_user_status(user_id: int, change: UserStatusUpdate, current_user: dict = Depends(require_roles(ADMIN_ROLES))):
+        with closing(connect()) as db:
+            target = db.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not target:
+                raise HTTPException(status_code=404, detail="User not found")
+            if target["id"] == current_user["id"] and not change.is_active:
+                raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
+            if (is_protected_super_admin(target["username"]) or target["role"] in {"Super Administrator", "System Administrator"}) and not is_super_admin(current_user):
+                raise HTTPException(status_code=403, detail="Only a Super Administrator may change administrator account status")
+            if not is_super_admin(current_user) and target["role"] not in allowed_managed_roles(current_user):
+                raise HTTPException(status_code=403, detail="You cannot change this account status")
+            db.execute("UPDATE users SET is_active = ? WHERE id = ?", (1 if change.is_active else 0, user_id))
+            audit(db, current_user["username"], "user.status_change", "user", user_id, f"is_active={change.is_active}")
+            db.commit()
+        return {"message": "User status updated", "is_active": change.is_active}
 
     @router.patch("/api/users/{user_id}/password")
     def reset_user_password(user_id: int, change: dict, current_user: dict = Depends(require_roles(ADMIN_ROLES))):
         new_password = change.get("password")
         validate_password(new_password)
         with closing(connect()) as db:
-            target = db.execute("SELECT id FROM users WHERE id = ?", (user_id,)).fetchone()
+            target = db.execute("SELECT id,role FROM users WHERE id = ?", (user_id,)).fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
+            if target["role"] in {"Super Administrator", "System Administrator"} and not is_super_admin(current_user):
+                raise HTTPException(status_code=403, detail="Only a Super Administrator may reset administrator passwords")
 
             hashed = get_password_hash(new_password)
             db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed, user_id))

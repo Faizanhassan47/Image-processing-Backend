@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from services.image_validation import ImageValidationError, validate_image_file
+from services.ai_subscription_service import AISubscriptionService, HOVERNET
 from core.audit_context import get_audit_context
 from services.scanner_adapters import ADAPTERS, CONVERTERS
 from services.hl7_engine import (
@@ -952,10 +953,13 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
 
     @router.post('/ai/jobs', status_code=202)
     def create_ai_job(item: AiJobCreate, user=Depends(require_roles(ai_roles))):
+        AISubscriptionService(connect).require_entitlement(user, HOVERNET)
         with connect() as db:
             model=db.execute('SELECT id,approval_status FROM ai_models WHERE id=?',(item.model_id,)).fetchone()
-            slide=db.execute('SELECT id FROM slides WHERE id=?',(item.slide_id,)).fetchone()
+            slide=db.execute('SELECT s.id,c.reviewer FROM slides s JOIN cases c ON c.id=s.case_id WHERE s.id=?',(item.slide_id,)).fetchone()
             if not model or not slide: raise HTTPException(400,'Invalid model or slide')
+            if user['role'] == 'Pathologist' and (slide['reviewer'] or '').strip().casefold() not in {user['username'].casefold(), user['display_name'].casefold()}:
+                raise HTTPException(403, 'Pathologists may access only cases assigned to them')
             if user['role'] == 'Pathologist' and model['approval_status'] != 'Validated': raise HTTPException(409,'Pathologists may run only validated models')
             if model['approval_status'] == 'Retired': raise HTTPException(409,'Retired models cannot accept new jobs')
             image_version_id=item.image_version_id

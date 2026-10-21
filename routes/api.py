@@ -4,6 +4,8 @@ from fastapi import APIRouter
 from routes.patient_api import create_patient_router, init_patient_schema
 from routes.platform_api import create_platform_router, init_platform_schema
 from routes.ai_api import create_ai_router
+from routes.ai_subscription_api import create_ai_subscription_router
+from routes.ai_licensing_api import create_ai_licensing_router
 from routes.auth_api import create_auth_router
 from routes.cases_api import create_cases_router
 from routes.annotations_api import create_annotations_router
@@ -49,6 +51,9 @@ def create_api_router(
     Constructs and returns the master APIRouter containing all domain sub-routers.
     """
     master_router = APIRouter()
+
+    master_router.include_router(create_ai_subscription_router(connect_fn, require_roles_fn, get_current_user_fn, audit_fn))
+    master_router.include_router(create_ai_licensing_router(connect_fn, get_current_user_fn))
 
     # 1. Authentication & User Management
     auth_router = create_auth_router(
@@ -121,8 +126,8 @@ def create_api_router(
             get_slide_func=get_slide_fn,
             get_case_func=get_case_fn,
             stored_path_func=stored_path_fn,
+            require_assigned_case_func=require_assigned_case_fn,
         )
         master_router.include_router(ai_router)
 
     return master_router
-
