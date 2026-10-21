@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
@@ -210,7 +211,7 @@ def create_cases_router(
             raise
         return filename, validation
 
-    async def add_slide_record(case_pk, image, label, stain="", specimen_description=""):
+    async def add_slide_record(case_pk, image, label, stain="", specimen_description="", prepared_slide_id=None, block_id=None):
         get_case_fn(case_pk)
         label = label.strip()
         if not label or len(label) > 120:
@@ -237,12 +238,14 @@ def create_cases_router(
                 cursor = db.execute("""INSERT INTO slides
                     (case_id, label, stain, specimen_description, filename, file_type,
                      format, file_size, width, height, level_count, upload_state,
-                     qc_status, qc_blur, qc_missing_tissue, qc_note, qc_actor, qc_timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 'System Automated QC', SYSUTCDATETIME())""",
+                     qc_status, qc_blur, qc_missing_tissue, qc_note, qc_actor, qc_timestamp,
+                     prepared_slide_id, block_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 'System Automated QC', SYSUTCDATETIME(), ?, ?)""",
                     (case_pk, label, stain.strip(), specimen_description.strip(), filename,
                      validation["file_type"], validation["format"], validation["file_size"],
                      validation["width"], validation["height"], validation["level_count"],
-                     qc_status_init, qc_blur_flag, qc_tissue_flag, qc_note_init))
+                     qc_status_init, qc_blur_flag, qc_tissue_flag, qc_note_init,
+                     prepared_slide_id, block_id))
                 calibration = validation["physical_calibration"]
                 pixel_size = calibration["pixel_size_microns_x"] if calibration["available"] else None
                 db.execute("""INSERT INTO image_versions
@@ -257,6 +260,19 @@ def create_cases_router(
         return row
 
     # --- Cases Endpoints ---
+
+    @router.get("/api/reviewers", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
+    def list_reviewers():
+        """Return the active pathologists who can be assigned to a case."""
+        with closing(connect()) as db:
+            rows = db.execute(
+                """SELECT id, username, display_name
+                   FROM users
+                   WHERE role = ? AND is_active = 1
+                   ORDER BY display_name, username""",
+                (ROLE_PATHOLOGIST,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @router.get("/api/cases", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
     def list_cases(
@@ -349,6 +365,14 @@ def create_cases_router(
         if reviewer == previous:
             raise HTTPException(400, "Reviewer is already set to that value")
         with closing(connect()) as db:
+            if reviewer:
+                eligible_reviewer = db.execute(
+                    """SELECT id FROM users
+                       WHERE username = ? AND role = ? AND is_active = 1""",
+                    (reviewer, ROLE_PATHOLOGIST),
+                ).fetchone()
+                if eligible_reviewer is None:
+                    raise HTTPException(400, "Reviewer must be an active Pathologist")
             db.execute("UPDATE cases SET reviewer = ? WHERE id = ?", (reviewer, case_pk))
             _append_history(db, case_pk, "reviewer", previous, reviewer, actor)
             db.commit()
@@ -414,8 +438,10 @@ def create_cases_router(
         label: str = Form(...),
         stain: str = Form(""),
         specimen_description: str = Form(""),
+        prepared_slide_id: Optional[int] = Form(None),
+        block_id: Optional[int] = Form(None),
     ):
-        return serialize_slide(await add_slide_record(case_pk, image, label, stain, specimen_description))
+        return serialize_slide(await add_slide_record(case_pk, image, label, stain, specimen_description, prepared_slide_id, block_id))
 
     @router.patch("/api/slides/{slide_id}", dependencies=[Depends(require_roles(INTAKE_ROLES))])
     def update_slide(slide_id: int, update: SlideUpdate):

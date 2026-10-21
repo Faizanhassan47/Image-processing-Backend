@@ -106,6 +106,17 @@ def test_backup_endpoint_restricted_to_admin():
     response_admin = client.get("/api/platform/backups", headers=headers_admin)
     assert response_admin.status_code == 200
 
+def test_reviewer_directory_returns_only_active_pathologists():
+    headers = make_auth_headers("test_lab_mgr", "Laboratory Manager")
+    response = client.get("/api/reviewers", headers=headers)
+
+    assert response.status_code == 200
+    reviewers = response.json()
+    usernames = {reviewer["username"] for reviewer in reviewers}
+    assert {"dr_alice", "dr_bob"}.issubset(usernames)
+    assert "disabled_user" not in usernames
+    assert all(set(reviewer) == {"id", "username", "display_name"} for reviewer in reviewers)
+
 # =====================================================================
 # 3. PATHOLOGIST ASSIGNED-CASE BOUNDARIES & RECORD-LEVEL ACCESS
 # =====================================================================
