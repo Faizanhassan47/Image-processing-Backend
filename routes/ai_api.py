@@ -772,7 +772,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
     @router.get("/api/ai/analyses/{analysis_id}/report.pdf")
     def download_ai_report_pdf(
         analysis_id: int,
-        current_user=Depends(require_roles_func(ai_read_roles)),
+        current_user: dict = Depends(require_roles_func(ai_read_roles)),
     ):
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)

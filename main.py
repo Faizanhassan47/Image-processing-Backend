@@ -21,10 +21,18 @@ from core.config import (
     CSRF_PROTECTION_ENABLED,
     UPLOADS_DIR,
     WSI_MAX_BYTES,
+    SECRET_KEY,
+    ALGORITHM,
     env_bool,
 )
 from core.database import connect
-from core.security import audit, get_current_user, require_roles
+from core.security import (
+    audit,
+    get_current_user,
+    get_password_hash,
+    require_roles,
+    validate_password,
+)
 from routes import create_api_router, init_all_schemas
 from services.slide_cache import (
     OPENSLIDE_IMPORT_ERROR,
@@ -86,6 +94,7 @@ app.add_middleware(
     allow_credentials=env_bool("CORS_ALLOW_CREDENTIALS", False),
     allow_methods=[method.strip() for method in os.getenv("CORS_ALLOW_METHODS", "GET,POST,PATCH,DELETE,OPTIONS").split(",") if method.strip()],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
