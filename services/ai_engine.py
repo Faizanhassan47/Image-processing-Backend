@@ -1519,6 +1519,7 @@ def save_ai_analysis_record(
 
         type_counts = analysis_data.get("type_counts", {})
         summary_payload = {
+            "feature_code": roi_info.get("feature_code", "HOVERNET"),
             "morphology": analysis_data.get("morphology"),
             "confidence_statistics": score_stats,
             "type_summary": analysis_data.get("type_summary"),

@@ -1,5 +1,6 @@
 import io
 import sys
+from uuid import uuid4
 from pathlib import Path
 import pytest
 
@@ -197,3 +198,80 @@ def test_system_health_endpoint():
     assert "hardware" in health
     assert "cpu_percent" in health["hardware"]
     assert "memory_used_percent" in health["hardware"]
+
+
+# =====================================================================
+# 7. FINALIZED-REPORT PRESERVATION & BROWSER HARDENING
+# =====================================================================
+
+def test_security_headers_are_present_on_api_responses():
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["referrer-policy"] == "strict-origin-when-cross-origin"
+
+
+def test_case_with_finalized_report_cannot_be_deleted():
+    case_code = f"LOCKED-{uuid4().hex[:12]}"
+    with connect() as db:
+        case_id = db.execute(
+            "INSERT INTO cases (case_id, description) VALUES (?, ?)",
+            (case_code, "Finalized report preservation test"),
+        ).lastrowid
+        db.execute(
+            "INSERT INTO reports (case_id, version, status, reviewer_name, finalized_at) VALUES (?, 1, 'Finalized', ?, SYSUTCDATETIME())",
+            (case_id, "ETDDev"),
+        )
+        db.commit()
+
+    try:
+        response = client.delete(
+            f"/api/platform/cases/{case_id}",
+            headers=make_auth_headers("ETDDev", "Super Administrator"),
+        )
+        assert response.status_code == 409
+        assert "finalized reports" in response.json()["detail"].lower()
+        with connect() as db:
+            assert db.execute("SELECT id FROM cases WHERE id=?", (case_id,)).fetchone() is not None
+    finally:
+        with connect() as db:
+            db.execute("DELETE FROM reports WHERE case_id=?", (case_id,))
+            db.execute("DELETE FROM cases WHERE id=?", (case_id,))
+            db.commit()
+
+
+def test_notification_recipient_can_read_only_own_notification():
+    admin_headers = make_auth_headers("ETDDev", "Super Administrator")
+    create_response = client.post(
+        "/api/platform/notifications",
+        headers=admin_headers,
+        json={
+            "recipient_username": "dr_alice",
+            "notification_type": "test.notification",
+            "title": "Security test notification",
+            "body": "Verify recipient-only access.",
+            "severity": "Info",
+        },
+    )
+    assert create_response.status_code == 201
+    notification_id = create_response.json()["id"]
+    try:
+        alice_headers = make_auth_headers("dr_alice", "Pathologist")
+        listed = client.get("/api/platform/notifications?unread_only=true", headers=alice_headers)
+        assert listed.status_code == 200
+        assert any(item["id"] == notification_id for item in listed.json())
+
+        wrong_user = client.patch(
+            f"/api/platform/notifications/{notification_id}/read",
+            headers=make_auth_headers("dr_bob", "Pathologist"),
+        )
+        assert wrong_user.status_code == 403
+
+        read = client.patch(f"/api/platform/notifications/{notification_id}/read", headers=alice_headers)
+        assert read.status_code == 200
+        assert read.json()["is_read"] is True
+    finally:
+        with connect() as db:
+            db.execute("DELETE FROM notifications WHERE id=?", (notification_id,))
+            db.commit()

@@ -34,7 +34,7 @@ class ReportUpdate(BaseModel):
     findings: List[ReportFindingCreate] = []
 
 
-def create_reports_router(connect, require_roles, get_current_user, get_case_fn, require_assigned_case_fn):
+def create_reports_router(connect, require_roles, get_current_user, get_case_fn, require_assigned_case_fn, audit):
     router = APIRouter(tags=["Reports"])
 
     pathologist_and_admin = ADMIN_ROLES + [ROLE_PATHOLOGIST]
@@ -103,6 +103,7 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
                 )
                 new_id = cursor.lastrowid
 
+            audit(db, current_user["username"], "report.create_draft", "report", new_id, f"case_id={case_pk}; version={next_version}")
             db.commit()
             row = db.execute("SELECT * FROM reports WHERE id = ?", (new_id,)).fetchone()
         return serialize_report(row)
@@ -142,6 +143,7 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
                     "INSERT INTO report_findings (report_id, slide_id, annotation_id, text, sort_order) VALUES (?, ?, ?, ?, ?)",
                     (report_id, f.slide_id, f.annotation_id, f.text.strip(), f.sort_order)
                 )
+            audit(db, current_user["username"], "report.update", "report", report_id, f"findings={len(update.findings)}")
             db.commit()
             row = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         return serialize_report(row)
@@ -158,6 +160,7 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
 
             now = datetime.now(timezone.utc).replace(tzinfo=None)
             db.execute("UPDATE reports SET status = 'Finalized', finalized_at = ? WHERE id = ?", (now, report_id))
+            audit(db, current_user["username"], "report.finalize", "report", report_id, f"case_id={report['case_id']}; version={report['version']}")
             db.commit()
             row = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
         return serialize_report(row)

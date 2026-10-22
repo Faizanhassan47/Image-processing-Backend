@@ -49,6 +49,7 @@ logger = logging.getLogger("pathology.ai_api")
 
 
 class AIAnalysisRequest(BaseModel):
+    feature_code: str = HOVERNET
     x: int | None = None
     y: int | None = None
     width: int | None = None
@@ -96,6 +97,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         eff_h: int,
         level: int,
         auto_tissue: bool,
+        feature_code: str,
         slide: openslide.OpenSlide,
         job: AIJob | None = None,
     ) -> dict:
@@ -259,6 +261,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
             logger.warning("PDF report generation encountered an issue: %s", pdf_exc)
             report_filename = None
 
+        roi_meta["feature_code"] = feature_code
         analysis_id = save_ai_analysis_record(
             connect_func=connect_func,
             slide_row=slide_row,
@@ -406,7 +409,12 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         current_user: dict = Depends(require_roles_func(ai_run_roles)),
     ):
         slide_row, case_row = _authorized_slide(slide_id, current_user)
-        subscriptions.require_entitlement(current_user, HOVERNET)
+        # The viewer sends its selected catalog feature. HoVer-Net is currently
+        # the only executable slide-analysis engine, and entitlement is checked
+        # again on the server before work is created.
+        if req.feature_code != HOVERNET:
+            raise HTTPException(422, "The selected AI feature is not available in the slide viewer.")
+        subscriptions.require_entitlement(current_user, req.feature_code)
 
         slide_path = stored_path_func(slide_row["filename"])
         if not slide_path.is_file():
@@ -419,6 +427,26 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         if req.auto_tissue:
             eff_x = None
             eff_y = None
+
+        with closing(connect_func()) as audit_db:
+            audit_db.execute(
+                "INSERT INTO audit_log (actor_username,action,target_type,target_id,details) VALUES (?,?,?,?,?)",
+                (
+                    current_user["username"],
+                    "ai.analysis.requested",
+                    "slide",
+                    str(slide_id),
+                    json.dumps({
+                        "feature_code": req.feature_code,
+                        "model_name": MODEL_NAME,
+                        "model_version": MODEL_VERSION,
+                        "case_id": case_row["id"],
+                        "roi": {"x": eff_x, "y": eff_y, "width": eff_w, "height": eff_h, "level": req.level},
+                        "auto_tissue": req.auto_tissue,
+                    }),
+                ),
+            )
+            audit_db.commit()
 
         try:
             slide = openslide.OpenSlide(str(slide_path))
@@ -471,6 +499,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                         eff_h=eff_h,
                         level=req.level,
                         auto_tissue=req.auto_tissue,
+                        feature_code=req.feature_code,
                         slide=slide,
                         job=job,
                     )
@@ -508,6 +537,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                 eff_h=eff_h,
                 level=req.level,
                 auto_tissue=req.auto_tissue,
+                feature_code=req.feature_code,
                 slide=slide,
                 job=None,
             )
