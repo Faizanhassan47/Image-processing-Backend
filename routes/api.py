@@ -115,6 +115,7 @@ def create_api_router(
             get_current_user=get_current_user_fn,
             get_case_fn=get_case_fn,
             require_assigned_case_fn=require_assigned_case_fn,
+            audit=audit_fn,
         )
         master_router.include_router(reports_router)
 
@@ -129,5 +130,21 @@ def create_api_router(
             require_assigned_case_func=require_assigned_case_fn,
         )
         master_router.include_router(ai_router)
+
+        # 8. Multi-Slide Registration & Advanced Viewing Trails
+        from routes.registrations_api import create_registrations_router
+        registrations_router = create_registrations_router(
+            connect=connect_fn,
+            require_roles=require_roles_fn,
+            get_current_user=get_current_user_fn,
+            audit=audit_fn,
+            uploads_dir=uploads_path,
+            openslide_module=openslide_module,
+            get_slide_fn=get_slide_fn,
+            get_case_fn=get_case_fn,
+            require_assigned_case_fn=require_assigned_case_fn,
+            stored_path_fn=stored_path_fn,
+        )
+        master_router.include_router(registrations_router)
 
     return master_router

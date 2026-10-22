@@ -9,9 +9,11 @@ Centralizes all HTTP middlewares:
 from .auth_access import AuthAccessMiddleware
 from .csrf import CSRFMiddleware
 from .observability import ObservabilityMiddleware
+from .security_headers import SecurityHeadersMiddleware
 
 __all__ = [
     "AuthAccessMiddleware",
     "ObservabilityMiddleware",
     "CSRFMiddleware",
+    "SecurityHeadersMiddleware",
 ]

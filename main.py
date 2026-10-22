@@ -75,6 +75,7 @@ from middleware import (
     AuthAccessMiddleware,
     CSRFMiddleware,
     ObservabilityMiddleware,
+    SecurityHeadersMiddleware,
 )
 
 # 1. Observability, correlation IDs, and client IP detection
@@ -86,7 +87,11 @@ app.add_middleware(AuthAccessMiddleware)
 # 3. Cross-Site Request Forgery protection
 app.add_middleware(CSRFMiddleware)
 
-# 4. CORS configuration
+# 4. Conservative browser security headers. CSP/HSTS are deployment concerns
+# and must be configured only after the production HTTPS/topology is known.
+app.add_middleware(SecurityHeadersMiddleware)
+
+# 5. CORS configuration
 import os
 app.add_middleware(
     CORSMiddleware,

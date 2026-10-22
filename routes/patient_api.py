@@ -458,6 +458,19 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
             case_ids = [row["case_id"] for row in linked_cases if row.get("case_id")]
 
             if cascade_cases and case_ids:
+                case_marks = ",".join("?" for _ in case_ids)
+                finalized_case = db.execute(
+                    f"""SELECT TOP 1 c.case_id
+                        FROM cases c
+                        JOIN reports r ON r.case_id = c.id
+                        WHERE c.id IN ({case_marks}) AND r.status = 'Finalized'""",
+                    tuple(case_ids),
+                ).fetchone()
+                if finalized_case:
+                    raise HTTPException(
+                        409,
+                        f"Cannot delete patient while linked case '{finalized_case['case_id']}' has a finalized report. Archive the patient or unlink non-finalized cases instead.",
+                    )
                 for case_id in case_ids:
                     case = db.execute("SELECT id, case_id, filename, status FROM cases WHERE id=?", (case_id,)).fetchone()
                     if not case:

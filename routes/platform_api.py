@@ -13,6 +13,8 @@ import shutil
 import time
 from uuid import uuid4
 
+from typing import List, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
@@ -151,6 +153,15 @@ DDL = [
 """IF OBJECT_ID('backup_runs','U') IS NULL CREATE TABLE backup_runs (
  id INT IDENTITY PRIMARY KEY, correlation_id VARCHAR(64) UNIQUE NOT NULL, status VARCHAR(30) NOT NULL, destination VARCHAR(2048),
  manifest_json VARCHAR(MAX), error_detail VARCHAR(MAX), started_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(), completed_at DATETIME2 NULL)""",
+"""IF OBJECT_ID('notifications','U') IS NULL CREATE TABLE notifications (
+ id BIGINT IDENTITY PRIMARY KEY, recipient_username VARCHAR(255) NOT NULL, notification_type VARCHAR(80) NOT NULL,
+ title VARCHAR(255) NOT NULL, body VARCHAR(2000) NULL, case_id INT NULL REFERENCES cases(id), report_id INT NULL REFERENCES reports(id),
+ slide_id INT NULL REFERENCES slides(id), severity VARCHAR(20) NOT NULL CONSTRAINT DF_notifications_severity DEFAULT 'Info',
+ is_read BIT NOT NULL CONSTRAINT DF_notifications_read DEFAULT 0, read_at DATETIME2 NULL,
+ created_at DATETIME2 NOT NULL CONSTRAINT DF_notifications_created DEFAULT SYSUTCDATETIME(),
+ CONSTRAINT CK_notifications_severity CHECK (severity IN ('Info','Warning','Critical')))
+""",
+"""IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name='IX_notifications_recipient_unread' AND object_id=OBJECT_ID('notifications')) CREATE INDEX IX_notifications_recipient_unread ON notifications(recipient_username,is_read,created_at DESC)""",
 ]
 
 
@@ -205,6 +216,16 @@ class CaseConfiguration(BaseModel):
     due_at: datetime | None = None
     exception_reason: str | None = Field(default=None, max_length=2000)
 
+class NotificationCreate(BaseModel):
+    recipient_username: str = Field(min_length=1, max_length=255)
+    notification_type: str = Field(min_length=1, max_length=80)
+    title: str = Field(min_length=1, max_length=255)
+    body: str = Field(default='', max_length=2000)
+    case_id: int | None = None
+    report_id: int | None = None
+    slide_id: int | None = None
+    severity: str = Field(default='Info', pattern=r'^(Info|Warning|Critical)$')
+
 class CaseLinkCreate(BaseModel):
     related_case_id: int
     link_type: str = Field(default='Prior', pattern=r'^(Prior|Related)$')
@@ -236,11 +257,26 @@ class ViewerBookmarkCreate(BaseModel):
     viewport_width: float = Field(gt=0)
     viewport_height: float = Field(gt=0)
     rotation: float = 0
+    flip_h: bool = False
+    flip_v: bool = False
+    brightness: int = 100
+    contrast: int = 100
+    gamma: float = 1.0
+    annotations_visible: bool = True
+    minimap_visible: bool = True
+
+class ViewerBookmarkRename(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
 
 class ViewerPreferencesUpdate(BaseModel):
     display_profile: str = Field(pattern=r'^(standard|grayscale|inverted|high-contrast|low-saturation|high-saturation|red-channel|green-channel|blue-channel|hue-positive|hue-negative)$')
-    brightness: int = Field(ge=50, le=150, multiple_of=5)
-    contrast: int = Field(ge=50, le=150, multiple_of=5)
+    brightness: int = Field(ge=50, le=200)
+    contrast: int = Field(ge=50, le=200)
+    gamma: Optional[float] = Field(default=1.0, ge=0.2, le=3.0)
+    flip_h: Optional[bool] = False
+    flip_v: Optional[bool] = False
+    minimap_visible: Optional[bool] = True
+    trail_visible: Optional[bool] = False
 
 class AiCorrectionCreate(BaseModel):
     label: str = Field(min_length=1, max_length=120)
@@ -253,7 +289,7 @@ class ReportWorkflowUpdate(BaseModel):
 
 class ReportTemplateCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
-    sections: list[str] = Field(min_length=1, max_length=30)
+    sections: List[str] = Field(min_length=1, max_length=30)
 
 class ConsultationCreate(BaseModel):
     consultant_username: str = Field(min_length=1, max_length=255)
@@ -436,9 +472,24 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
     def create_viewer_bookmark(slide_id:int,item:ViewerBookmarkCreate,user=Depends(require_roles(['System Administrator','Pathologist']))):
         with connect() as db:
             if not db.execute('SELECT id FROM slides WHERE id=?',(slide_id,)).fetchone(): raise HTTPException(404,'Slide not found')
-            cur=db.execute('INSERT INTO viewer_bookmarks (slide_id,name,viewport_x,viewport_y,viewport_width,viewport_height,rotation,created_by) VALUES (?,?,?,?,?,?,?,?)',
-              (slide_id,item.name,item.viewport_x,item.viewport_y,item.viewport_width,item.viewport_height,item.rotation,user['username'])); db.commit()
+            cur=db.execute('''INSERT INTO viewer_bookmarks
+                (slide_id,name,viewport_x,viewport_y,viewport_width,viewport_height,rotation,created_by,
+                 flip_h,flip_v,brightness,contrast,gamma,annotations_visible,minimap_visible)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+              (slide_id,item.name,item.viewport_x,item.viewport_y,item.viewport_width,item.viewport_height,item.rotation,user['username'],
+               1 if item.flip_h else 0, 1 if item.flip_v else 0, item.brightness, item.contrast, item.gamma,
+               1 if item.annotations_visible else 0, 1 if item.minimap_visible else 0)); db.commit()
         return {'id':cur.lastrowid,'slide_id':slide_id,**item.model_dump(),'created_by':user['username']}
+
+    @router.patch('/slides/{slide_id}/bookmarks/{bookmark_id}')
+    def rename_viewer_bookmark(slide_id:int,bookmark_id:int,item:ViewerBookmarkRename,user=Depends(require_roles(['System Administrator','Pathologist']))):
+        with connect() as db:
+            row=db.execute('SELECT created_by FROM viewer_bookmarks WHERE id=? AND slide_id=?',(bookmark_id,slide_id)).fetchone()
+            if not row: raise HTTPException(404,'Bookmark not found')
+            if user['role'] not in {'System Administrator','Super Administrator'} and row['created_by'] != user['username']: raise HTTPException(403,'Only the bookmark owner can rename it')
+            db.execute('UPDATE viewer_bookmarks SET name=? WHERE id=?',(item.name.strip(),bookmark_id)); db.commit()
+            updated=db.execute('SELECT * FROM viewer_bookmarks WHERE id=?',(bookmark_id,)).fetchone()
+        return dict(updated)
 
     @router.delete('/slides/{slide_id}/bookmarks/{bookmark_id}',status_code=204)
     def delete_viewer_bookmark(slide_id:int,bookmark_id:int,user=Depends(require_roles(['System Administrator','Pathologist']))):
@@ -499,10 +550,62 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             if field in supplied: assignments.append(f'{field}=?'); params.append(getattr(item,field))
         if not assignments: raise HTTPException(400,'No case fields were supplied')
         with connect() as db:
-            if not db.execute('SELECT id FROM cases WHERE id=?',(case_id,)).fetchone(): raise HTTPException(404,'Case not found')
+            case = db.execute('SELECT id,case_id,reviewer,priority,due_at FROM cases WHERE id=?',(case_id,)).fetchone()
+            if not case: raise HTTPException(404,'Case not found')
             db.execute(f"UPDATE cases SET {','.join(assignments)} WHERE id=?",(*params,case_id))
-            db.execute('INSERT INTO case_operations (operation_type,source_case_id,details_json,authorized_by) VALUES (?,?,?,?)',('configuration',case_id,json.dumps(item.model_dump(mode='json',exclude_unset=True)),user['username'])); db.commit()
+            db.execute('INSERT INTO case_operations (operation_type,source_case_id,details_json,authorized_by) VALUES (?,?,?,?)',('configuration',case_id,json.dumps(item.model_dump(mode='json',exclude_unset=True)),user['username']))
+            if 'reviewer' in supplied and item.reviewer and item.reviewer != case['reviewer']:
+                db.execute("""INSERT INTO notifications (recipient_username,notification_type,title,body,case_id,severity)
+                              VALUES (?,?,?,?,?,'Info')""",
+                           (item.reviewer, 'case.assigned', 'Case assigned', f"You were assigned case {case['case_id']}.", case_id))
+            if 'priority' in supplied and item.priority in {'Urgent', 'Stat'}:
+                recipient = item.reviewer if 'reviewer' in supplied else case['reviewer']
+                if recipient:
+                    db.execute("""INSERT INTO notifications (recipient_username,notification_type,title,body,case_id,severity)
+                                  VALUES (?,?,?,?,?,'Warning')""",
+                               (recipient, 'case.priority', f"{item.priority} case", f"Case {case['case_id']} is marked {item.priority}.", case_id))
+            db.commit()
         return {'id':case_id,**item.model_dump(exclude_unset=True)}
+
+    @router.get('/notifications')
+    def list_notifications(unread_only: bool = False, limit: int = Query(50, ge=1, le=200), user=Depends(get_current_user)):
+        with connect() as db:
+            where = 'WHERE recipient_username=?'
+            params = [user['username']]
+            if unread_only:
+                where += ' AND is_read=0'
+            rows = db.execute(
+                f"SELECT TOP {limit} * FROM notifications {where} ORDER BY is_read ASC, created_at DESC, id DESC",
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @router.post('/notifications', status_code=201)
+    def create_notification(item: NotificationCreate, user=Depends(require_roles(administrators))):
+        with connect() as db:
+            recipient = db.execute('SELECT username,is_active FROM users WHERE username=?', (item.recipient_username,)).fetchone()
+            if not recipient or not recipient['is_active']:
+                raise HTTPException(400, 'Notification recipient must be an active user')
+            for table, value in (('cases', item.case_id), ('reports', item.report_id), ('slides', item.slide_id)):
+                if value is not None and not db.execute(f'SELECT id FROM {table} WHERE id=?', (value,)).fetchone():
+                    raise HTTPException(400, f'{table[:-1].capitalize()} not found')
+            cursor = db.execute("""INSERT INTO notifications (recipient_username,notification_type,title,body,case_id,report_id,slide_id,severity)
+                                 VALUES (?,?,?,?,?,?,?,?)""",
+                                (item.recipient_username, item.notification_type, item.title, item.body, item.case_id, item.report_id, item.slide_id, item.severity))
+            db.commit()
+        return {'id': cursor.lastrowid, **item.model_dump(), 'is_read': False}
+
+    @router.patch('/notifications/{notification_id}/read')
+    def mark_notification_read(notification_id: int, user=Depends(get_current_user)):
+        with connect() as db:
+            notification = db.execute('SELECT id,recipient_username FROM notifications WHERE id=?', (notification_id,)).fetchone()
+            if not notification:
+                raise HTTPException(404, 'Notification not found')
+            if notification['recipient_username'].casefold() != user['username'].casefold():
+                raise HTTPException(403, 'Notifications may only be updated by their recipient')
+            db.execute("UPDATE notifications SET is_read=1,read_at=COALESCE(read_at,SYSUTCDATETIME()) WHERE id=?", (notification_id,))
+            db.commit()
+        return {'id': notification_id, 'is_read': True}
 
     @router.get('/cases/{case_id}/timeline')
     def case_timeline(case_id:int,_=Depends(require_roles(clinical_read_roles))):
@@ -876,6 +979,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             case=db.execute('SELECT id,case_id,filename,status FROM cases WHERE id=?',(case_id,)).fetchone()
             if not case: raise HTTPException(404,'Case not found')
             finalized_reports=db.execute("SELECT COUNT(*) AS n FROM reports WHERE case_id=? AND status='Finalized'",(case_id,)).fetchone()['n']
+            if finalized_reports:
+                raise HTTPException(409, 'Cannot delete a case with finalized reports. Archive the case or create an amended report instead.')
             slides=db.execute('SELECT id,filename FROM slides WHERE case_id=?',(case_id,)).fetchall()
             slide_ids=[row['id'] for row in slides]
             filenames.extend(row['filename'] for row in slides if row.get('filename'))

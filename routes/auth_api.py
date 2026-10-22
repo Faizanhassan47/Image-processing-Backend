@@ -21,6 +21,8 @@ from core.config import (
     COOKIE_SECURE,
     LOGIN_RATE_LIMIT,
     LOGIN_RATE_WINDOW_SECONDS,
+    PASSWORD_MIN_LENGTH,
+    REQUIRE_PASSWORD_COMPLEXITY,
 )
 from core.security import (
     ADMIN_ROLES,
@@ -57,6 +59,18 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
         return {"Laboratory Manager", "Pathologist"}
 
     # --- Authentication Endpoints ---
+
+    @router.get("/api/auth/password-policy")
+    def password_policy():
+        """Returns non-sensitive password requirements for client-side guidance.
+
+        The server validates every password independently; this endpoint only
+        prevents the administration UI from presenting a weaker policy.
+        """
+        return {
+            "min_length": PASSWORD_MIN_LENGTH,
+            "require_letter_and_number": REQUIRE_PASSWORD_COMPLEXITY,
+        }
 
     @router.post("/api/auth/login")
     def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends()):

@@ -371,6 +371,72 @@ def init_db(connect_fn):
                  lc["height"] or 0),
             )
 
+        # --- Module 1 & 2: Slide Viewing Trails and Multi-Slide Registrations ---
+        db.execute("""
+            IF OBJECT_ID('dbo.slide_viewing_trails', 'U') IS NULL
+            CREATE TABLE dbo.slide_viewing_trails (
+                id              INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                slide_id        INT NOT NULL REFERENCES dbo.slides(id) ON DELETE CASCADE,
+                username        VARCHAR(255) NOT NULL,
+                coverage_json   NVARCHAR(MAX) NOT NULL,
+                created_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                updated_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT UQ_slide_viewing_trails UNIQUE (slide_id, username)
+            )
+        """)
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_slide_viewing_trails_user' AND object_id = OBJECT_ID('dbo.slide_viewing_trails')) CREATE INDEX idx_slide_viewing_trails_user ON dbo.slide_viewing_trails(username, updated_at DESC)")
+
+        db.execute("""
+            IF OBJECT_ID('dbo.slide_registrations', 'U') IS NULL
+            CREATE TABLE dbo.slide_registrations (
+                id                          INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                case_id                     INT NOT NULL REFERENCES dbo.cases(id) ON DELETE CASCADE,
+                reference_slide_id          INT NOT NULL REFERENCES dbo.slides(id),
+                moving_slide_id             INT NOT NULL REFERENCES dbo.slides(id),
+                reference_image_version_id  INT NULL REFERENCES dbo.image_versions(id),
+                moving_image_version_id     INT NULL REFERENCES dbo.image_versions(id),
+                registration_method         VARCHAR(60) NOT NULL DEFAULT 'manual',
+                transform_type              VARCHAR(60) NOT NULL DEFAULT 'affine',
+                transform_matrix_json       NVARCHAR(MAX) NULL,
+                landmarks_json              NVARCHAR(MAX) NOT NULL DEFAULT '[]',
+                quality_metrics_json        NVARCHAR(MAX) NULL,
+                status                      VARCHAR(30) NOT NULL DEFAULT 'Draft',
+                review_notes                NVARCHAR(1000) NULL,
+                created_by                  VARCHAR(255) NOT NULL,
+                created_at                  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                updated_at                  DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+                approved_by                 VARCHAR(255) NULL,
+                approved_at                 DATETIME2 NULL
+            )
+        """)
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_slide_registrations_case' AND object_id = OBJECT_ID('dbo.slide_registrations')) CREATE INDEX idx_slide_registrations_case ON dbo.slide_registrations(case_id, id DESC)")
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_slide_registrations_slides' AND object_id = OBJECT_ID('dbo.slide_registrations')) CREATE INDEX idx_slide_registrations_slides ON dbo.slide_registrations(reference_slide_id, moving_slide_id)")
+
+        db.execute("""
+            IF OBJECT_ID('dbo.slide_registration_history', 'U') IS NULL
+            CREATE TABLE dbo.slide_registration_history (
+                id                  INT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+                registration_id     INT NOT NULL REFERENCES dbo.slide_registrations(id) ON DELETE CASCADE,
+                action              VARCHAR(60) NOT NULL,
+                actor               VARCHAR(255) NOT NULL,
+                details_json        NVARCHAR(MAX) NULL,
+                created_at          DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            )
+        """)
+        db.execute("IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'idx_slide_reg_history_reg' AND object_id = OBJECT_ID('dbo.slide_registration_history')) CREATE INDEX idx_slide_reg_history_reg ON dbo.slide_registration_history(registration_id, id DESC)")
+
+        # Extend viewer_bookmarks columns for saved viewpoint attributes
+        for col_name, col_type, default_val in [
+            ('flip_h', 'BIT', '0'),
+            ('flip_v', 'BIT', '0'),
+            ('brightness', 'INT', '100'),
+            ('contrast', 'INT', '100'),
+            ('gamma', 'FLOAT', '1.0'),
+            ('annotations_visible', 'BIT', '1'),
+            ('minimap_visible', 'BIT', '1'),
+        ]:
+            db.execute(f"IF COL_LENGTH('dbo.viewer_bookmarks', '{col_name}') IS NULL ALTER TABLE dbo.viewer_bookmarks ADD {col_name} {col_type} NOT NULL CONSTRAINT DF_viewer_bookmarks_{col_name} DEFAULT ({default_val})")
+
         db.commit()
         try:
             from services.ai_engine import init_ai_schema
