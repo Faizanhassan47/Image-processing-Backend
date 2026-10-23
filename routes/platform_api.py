@@ -1254,6 +1254,51 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             db.execute("UPDATE integration_events SET acknowledgement=?,status=?,processed_at=SYSUTCDATETIME() WHERE id=?",(ack,'Acknowledged' if accepted else 'Rejected',event_id)); db.commit()
         return {'id':event_id,'acknowledgement':ack,'status':'Acknowledged' if accepted else 'Rejected'}
 
+    # Older deployments contain a placeholder reviewer value for cases that
+    # have not yet been assigned to a real pathologist. Treat it as unassigned
+    # so operational queues reflect work that still needs action.
+    unassigned_case_condition = """
+        reviewer IS NULL
+        OR LTRIM(RTRIM(CAST(reviewer AS NVARCHAR(255)))) = ''
+        OR LOWER(LTRIM(RTRIM(CAST(reviewer AS NVARCHAR(255))))) IN ('unassigned', 'assigned pathologist', 'dr. assigned pathologist')
+    """
+
+    @router.get('/dashboard/work-queue')
+    def dashboard_work_queue(_=Depends(require_roles(operational_roles))):
+        """Return the current actionable records that make up the operations queue."""
+        try:
+            with connect() as db:
+                unassigned_cases = db.execute(f"""
+                    SELECT TOP 100 id, case_id, description, status, reviewer, priority, due_at, created_at
+                    FROM cases
+                    WHERE ({unassigned_case_condition})
+                      AND CAST(status AS NVARCHAR(100)) <> 'Reviewed'
+                    ORDER BY created_at DESC, id DESC
+                """).fetchall()
+                rescan_slides = db.execute("""
+                    SELECT TOP 100 s.id, s.label, s.stain, s.qc_status, s.qc_note, s.created_at,
+                           c.id AS case_pk, c.case_id
+                    FROM slides s
+                    JOIN cases c ON c.id = s.case_id
+                    WHERE CAST(s.qc_status AS NVARCHAR(100)) = 'Needs rescan'
+                    ORDER BY s.created_at DESC, s.id DESC
+                """).fetchall()
+                reconciliation = db.execute("""
+                    SELECT TOP 100 r.id, j.original_filename, r.proposed_case_id, r.reason, r.created_at
+                    FROM reconciliation_items r
+                    LEFT JOIN ingestion_jobs j ON j.id = r.ingestion_job_id
+                    WHERE r.resolved_case_id IS NULL
+                    ORDER BY r.created_at DESC, r.id DESC
+                """).fetchall()
+            return {
+                'unassigned_cases': [dict(row) for row in unassigned_cases],
+                'rescan_slides': [dict(row) for row in rescan_slides],
+                'reconciliation_items': [dict(row) for row in reconciliation],
+            }
+        except Exception as exc:
+            logger.exception("Failed to load operational work queue: %s", exc)
+            raise HTTPException(status_code=500, detail="Operational work queue could not be loaded") from exc
+
     @router.get('/dashboard/metrics')
     def dashboard_metrics(_=Depends(require_roles(operational_roles))):
         """Calculates real-time operational and laboratory workflow metrics from SQL Server database."""
@@ -1264,7 +1309,7 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 new_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE CAST(status AS VARCHAR(50))='New'").fetchone()['n']
                 in_review_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE CAST(status AS VARCHAR(50))='In Review'").fetchone()['n']
                 reviewed_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE CAST(status AS VARCHAR(50))='Reviewed'").fetchone()['n']
-                unassigned_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE reviewer IS NULL OR CAST(reviewer AS VARCHAR(255))=''").fetchone()['n']
+                unassigned_cases = db.execute(f"SELECT COUNT(*) AS n FROM cases WHERE {unassigned_case_condition}").fetchone()['n']
                 urgent_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE priority IN ('Urgent', 'Stat')").fetchone()['n']
                 overdue_cases = db.execute("SELECT COUNT(*) AS n FROM cases WHERE due_at IS NOT NULL AND due_at < SYSUTCDATETIME() AND CAST(status AS VARCHAR(50)) <> 'Reviewed'").fetchone()['n']
 

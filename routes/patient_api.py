@@ -477,7 +477,32 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                         continue
                     if case.get("filename"):
                         filenames.append(case["filename"])
-                    slides = db.execute("SELECT id, filename FROM slides WHERE case_id=?", (case_id,)).fetchall()
+                    accession_rows = db.execute("SELECT id FROM accessions WHERE case_id=?", (case_id,)).fetchall()
+                    accession_ids = [row["id"] for row in accession_rows]
+                    specimen_ids = []
+                    block_ids = []
+                    if accession_ids:
+                        accession_marks = ",".join("?" for _ in accession_ids)
+                        specimen_rows = db.execute(
+                            f"SELECT id FROM specimens WHERE accession_id IN ({accession_marks})",
+                            tuple(accession_ids),
+                        ).fetchall()
+                        specimen_ids = [row["id"] for row in specimen_rows]
+                    if specimen_ids:
+                        specimen_marks = ",".join("?" for _ in specimen_ids)
+                        block_rows = db.execute(
+                            f"SELECT id FROM blocks WHERE specimen_id IN ({specimen_marks})",
+                            tuple(specimen_ids),
+                        ).fetchall()
+                        block_ids = [row["id"] for row in block_rows]
+
+                    slide_sql = "SELECT id, filename FROM slides WHERE case_id=?"
+                    slide_params = [case_id]
+                    if block_ids:
+                        block_marks = ",".join("?" for _ in block_ids)
+                        slide_sql += f" OR block_id IN ({block_marks})"
+                        slide_params.extend(block_ids)
+                    slides = db.execute(slide_sql, tuple(slide_params)).fetchall()
                     slide_ids = [row["id"] for row in slides]
                     filenames.extend(row["filename"] for row in slides if row.get("filename"))
                     if slide_ids:
@@ -485,6 +510,9 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                         versions = db.execute(f"SELECT id, stored_filename FROM image_versions WHERE slide_id IN ({slide_marks})", tuple(slide_ids)).fetchall()
                         filenames.extend(row["stored_filename"] for row in versions if row.get("stored_filename"))
                         version_ids = [row["id"] for row in versions]
+                        db.execute(f"DELETE FROM slide_registrations WHERE case_id=? OR reference_slide_id IN ({slide_marks}) OR moving_slide_id IN ({slide_marks})", (case_id, *slide_ids, *slide_ids))
+                        db.execute(f"UPDATE notifications SET slide_id=NULL WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"UPDATE report_findings SET slide_id=NULL WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
                         db.execute(f"UPDATE report_findings SET annotation_id=NULL WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id IN ({slide_marks}))", tuple(slide_ids))
                         db.execute(f"DELETE FROM annotation_revisions WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id IN ({slide_marks}))", tuple(slide_ids))
                         db.execute(f"DELETE FROM annotations WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
@@ -501,6 +529,7 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                             db.execute(f"DELETE FROM image_metadata_revisions WHERE image_version_id IN ({version_marks})", tuple(version_ids))
                         db.execute(f"DELETE FROM viewer_bookmarks WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
                         db.execute(f"DELETE FROM viewer_preferences WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
+                        db.execute(f"DELETE FROM slide_viewing_trails WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
                         db.execute(f"DELETE FROM slide_qc_history WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
                         db.execute(f"DELETE FROM image_versions WHERE slide_id IN ({slide_marks})", tuple(slide_ids))
                         db.execute(f"DELETE FROM slides WHERE id IN ({slide_marks})", tuple(slide_ids))
@@ -517,6 +546,16 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                     db.execute("DELETE FROM research_folder_members WHERE case_id=?", (case_id,))
                     db.execute("DELETE FROM case_links WHERE case_id=? OR related_case_id=?", (case_id, case_id))
                     db.execute("DELETE FROM case_operations WHERE source_case_id=? OR target_case_id=?", (case_id, case_id))
+                    db.execute("UPDATE notifications SET case_id=NULL WHERE case_id=?", (case_id,))
+                    db.execute("UPDATE patient_clinical_notes SET case_id=NULL WHERE case_id=?", (case_id,))
+                    db.execute("UPDATE patient_documents SET case_id=NULL WHERE case_id=?", (case_id,))
+                    db.execute("UPDATE patient_tests SET case_id=NULL WHERE case_id=?", (case_id,))
+                    # The clinical hierarchy is accession -> specimen -> block -> slide.
+                    # Delete leaf records before the accession (and therefore the case).
+                    if specimen_ids:
+                        specimen_marks = ",".join("?" for _ in specimen_ids)
+                        db.execute(f"DELETE FROM blocks WHERE specimen_id IN ({specimen_marks})", tuple(specimen_ids))
+                    db.execute("DELETE FROM specimens WHERE accession_id IN (SELECT id FROM accessions WHERE case_id=?)", (case_id,))
                     db.execute("DELETE FROM accessions WHERE case_id=?", (case_id,))
                     db.execute("UPDATE ingestion_jobs SET matched_case_id=NULL WHERE matched_case_id=?", (case_id,))
                     db.execute("UPDATE reconciliation_items SET resolved_case_id=NULL WHERE resolved_case_id=?", (case_id,))
@@ -528,6 +567,7 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                 db.execute("UPDATE accessions SET patient_id=NULL WHERE patient_id=?", (patient_id,))
 
             # Clean up unlinked accessions belonging directly to this patient
+            db.execute("DELETE FROM specimens WHERE accession_id IN (SELECT id FROM accessions WHERE patient_id=?)", (patient_id,))
             db.execute("DELETE FROM accessions WHERE patient_id=?", (patient_id,))
 
             # Remove associated child clinical and longitudinal data
