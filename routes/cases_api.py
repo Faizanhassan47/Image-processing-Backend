@@ -124,10 +124,22 @@ def create_cases_router(
                 slides = db.execute("SELECT * FROM slides WHERE case_id = ? ORDER BY id", (row["id"],)).fetchall()
                 notes = db.execute("SELECT * FROM case_review_notes WHERE case_id = ? ORDER BY id DESC", (row["id"],)).fetchall()
                 history = db.execute("SELECT * FROM case_review_history WHERE case_id = ? ORDER BY id DESC", (row["id"],)).fetchall()
+                patient = db.execute(
+                    """SELECT TOP 1 p.display_label, p.patient_identifier, p.medical_record_number
+                       FROM accessions a
+                       JOIN patients p ON p.id = a.patient_id
+                       WHERE a.case_id = ?
+                       ORDER BY a.created_at DESC""",
+                    (row["id"],),
+                ).fetchone()
             item["slides"] = [serialize_slide(slide) for slide in slides]
             item["slide_count"] = len(slides)
             item["review_notes"] = [dict(note) for note in notes]
             item["review_history"] = [dict(entry) for entry in history]
+            if patient:
+                item["patient_name"] = patient["display_label"]
+                item["patient_identifier"] = patient["patient_identifier"]
+                item["medical_record_number"] = patient["medical_record_number"]
         return item
 
     def require_wsi_slide(slide_id: int):
@@ -279,35 +291,62 @@ def create_cases_router(
         status_filter: str | None = Query(None, alias="status"),
         reviewer: str | None = Query(None),
         search: str | None = Query(None),
+        assigned_to_me: bool = Query(False),
+        sort_by: str = Query("created_at"),
+        sort_direction: str = Query("desc"),
+        limit: int | None = Query(None, ge=1, le=100),
+        offset: int = Query(0, ge=0),
         current_user: dict = Depends(get_current_user),
     ):
         clauses = []
         params = []
-        if current_user["role"] == "Pathologist":
-            clauses.append("(LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?) OR LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?))")
+        assigned_reviewer_clause = "(LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?) OR LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?))"
+        if current_user["role"] == "Pathologist" or assigned_to_me:
+            clauses.append(assigned_reviewer_clause)
             params.extend([current_user["username"], current_user["display_name"]])
+        # Some existing deployments still use SQL Server TEXT columns for case
+        # metadata. Cast textual fields before filtering or sorting so the API
+        # remains compatible while the schema is migrated gradually.
+        allowed_sorts = {
+            "created_at": "created_at",
+            "case_id": "CAST(case_id AS NVARCHAR(255))",
+            "status": "CAST(status AS NVARCHAR(100))",
+            "reviewer": "CAST(reviewer AS NVARCHAR(255))",
+        }
+        if sort_by not in allowed_sorts:
+            raise HTTPException(400, "Unsupported case sort field")
+        if sort_direction.lower() not in {"asc", "desc"}:
+            raise HTTPException(400, "Sort direction must be asc or desc")
+        order_by = f"{allowed_sorts[sort_by]} {sort_direction.upper()}, id DESC"
         if status_filter:
             if status_filter not in {"New", "In Review", "Reviewed"}:
                 raise HTTPException(400, "Status must be New, In Review, or Reviewed")
-            clauses.append("status = ?")
+            clauses.append("CAST(status AS NVARCHAR(100)) = ?")
             params.append(status_filter)
 
         if reviewer is not None:
             if reviewer.strip() == "":
-                clauses.append("reviewer = ''")
+                clauses.append("CAST(reviewer AS NVARCHAR(255)) = ''")
             else:
                 clauses.append("LOWER(CAST(reviewer AS NVARCHAR(MAX))) = LOWER(?)")
                 params.append(reviewer.strip())
 
         if search and search.strip():
             search_term = f"%{search.strip()}%"
-            clauses.append("(case_id LIKE ? OR description LIKE ?)")
+            clauses.append("(CAST(case_id AS NVARCHAR(255)) LIKE ? OR CAST(description AS NVARCHAR(MAX)) LIKE ?)")
             params.extend([search_term, search_term])
 
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with closing(connect()) as db:
-            rows = db.execute(f"SELECT * FROM cases{where} ORDER BY id DESC", params).fetchall()
-        return [serialize_case(row) for row in rows]
+            if limit is None:
+                rows = db.execute(f"SELECT * FROM cases{where} ORDER BY {order_by}", params).fetchall()
+                return [serialize_case(row) for row in rows]
+            total = db.execute(f"SELECT COUNT(*) AS total FROM cases{where}", params).fetchone()["total"]
+            rows = db.execute(
+                f"SELECT * FROM cases{where} ORDER BY {order_by} OFFSET ? ROWS FETCH NEXT ? ROWS ONLY",
+                [*params, offset, limit],
+            ).fetchall()
+        return {"items": [serialize_case(row) for row in rows], "total": total, "limit": limit, "offset": offset}
 
     @router.get("/api/cases/{case_pk}", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
     def case_detail(case_pk: int, current_user: dict = Depends(get_current_user)):

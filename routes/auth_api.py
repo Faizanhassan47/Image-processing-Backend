@@ -205,6 +205,11 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
             if count_row and count_row["cnt"] <= 1:
                 raise HTTPException(status_code=400, detail="Cannot delete the last remaining user")
 
+            # Remove entitlement records first. Some deployed databases predate the
+            # cascading foreign-key migration, so relying on database cascades would
+            # leave a user deletion vulnerable to a constraint failure.
+            db.execute("DELETE FROM user_ai_feature_preferences WHERE user_id = ?", (user_id,))
+            db.execute("DELETE FROM user_subscriptions WHERE user_id = ?", (user_id,))
             db.execute("DELETE FROM users WHERE id = ?", (user_id,))
             audit(db, current_user["username"], "user.delete", "user", user_id)
             db.commit()
@@ -265,8 +270,8 @@ def create_auth_router(connect, require_roles, get_current_user, audit):
             target = db.execute("SELECT id,role FROM users WHERE id = ?", (user_id,)).fetchone()
             if not target:
                 raise HTTPException(status_code=404, detail="User not found")
-            if target["role"] in {"Super Administrator", "System Administrator"} and not is_super_admin(current_user):
-                raise HTTPException(status_code=403, detail="Only a Super Administrator may reset administrator passwords")
+            if target["role"] == "Super Administrator" and not is_super_admin(current_user):
+                raise HTTPException(status_code=403, detail="Only a Super Administrator may reset Super Administrator passwords")
 
             hashed = get_password_hash(new_password)
             db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hashed, user_id))
