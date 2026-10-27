@@ -11,6 +11,7 @@ from routes.cases_api import create_cases_router
 from routes.annotations_api import create_annotations_router
 from routes.reports_api import create_reports_router
 from services.ai_engine import init_ai_schema
+from services.kongnet_engine import init_kongnet_schema
 
 __all__ = [
     "create_api_router",
@@ -31,6 +32,10 @@ def init_all_schemas(connect_fn):
     init_patient_schema(connect_fn)
     try:
         init_ai_schema(connect_fn)
+    except Exception:
+        pass
+    try:
+        init_kongnet_schema(connect_fn)
     except Exception:
         pass
 

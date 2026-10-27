@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 HOVERNET = "HOVERNET"
+MITOTIC_DETECTION = "MITOTIC_DETECTION"
 VALID_STATUSES = {"Active", "Expired", "Cancelled", "Suspended"}
 PROTECTED_SUPER_ADMINS = {"etddev", "etdadmin"}
 
