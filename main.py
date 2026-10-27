@@ -56,6 +56,7 @@ init_db()
 async def lifespan(_app):
     from routes.platform_api import watched_folder_loop
     from services.ai_engine import hovernet_manager
+    from services.kongnet_engine import kongnet_manager
 
     stop_event = asyncio.Event()
     watcher = asyncio.create_task(watched_folder_loop(connect, stop_event))
@@ -66,6 +67,7 @@ async def lifespan(_app):
         await watcher
         slide_cache.clear()
         hovernet_manager.stop_worker()
+        kongnet_manager.stop_worker()
 
 
 app = FastAPI(title=APP_NAME, lifespan=lifespan)

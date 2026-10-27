@@ -41,7 +41,7 @@ class GrantCreate(BaseModel):
     start_date: datetime
     end_date: datetime
 
-
+    
 class SeatAssign(BaseModel):
     subscription_id: int
     user_id: int

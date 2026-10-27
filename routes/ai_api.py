@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -19,6 +20,9 @@ import openslide
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
+from services.kongnet_engine import (
+    AI_GALLERY_DIR as KONGNET_GALLERY_DIR,
+)
 
 from services.ai_engine import (
     AI_GALLERY_DIR,
@@ -43,7 +47,18 @@ from services.ai_engine import (
     summarize_classification_scores,
     validate_roi_dimensions,
 )
-from services.ai_subscription_service import AISubscriptionService, HOVERNET
+from services.ai_subscription_service import AISubscriptionService, HOVERNET, MITOTIC_DETECTION
+from services.kongnet_engine import (
+    kongnet_manager,
+    calculate_kongnet_tiles,
+    create_mitotic_overlay_image,
+    extract_candidate_crops,
+    build_kongnet_pdf,
+    save_kongnet_analysis_record,
+    MODEL_NAME as KONGNET_MODEL_NAME,
+    MODEL_VERSION as KONGNET_MODEL_VERSION,
+    FEATURE_CODE as KONGNET_FEATURE_CODE,
+)
 
 logger = logging.getLogger("pathology.ai_api")
 
@@ -61,6 +76,9 @@ class AIAnalysisRequest(BaseModel):
     level: int = 0
     auto_tissue: bool = False
     run_in_background: bool | None = None
+    threshold: float | None = None
+    target_mpp: float | None = None
+    tta: bool = False
 
 
 def create_ai_router(connect_func, require_roles_func, get_current_user_func, get_slide_func, get_case_func, stored_path_func, require_assigned_case_func):
@@ -343,6 +361,255 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
 
         return response
 
+    def _execute_kongnet_pipeline(
+        slide_row: dict,
+        case_row: dict,
+        current_username: str,
+        eff_x: int | None,
+        eff_y: int | None,
+        eff_w: int,
+        eff_h: int,
+        level: int,
+        auto_tissue: bool,
+        feature_code: str,
+        slide: openslide.OpenSlide,
+        slide_path: Path,
+        threshold: float | None = None,
+        target_mpp: float | None = None,
+        tta: bool = False,
+        job: AIJob | None = None,
+    ) -> dict:
+        total_start_time = time.time()
+        slide_id = slide_row["id"]
+        if job:
+            job.status = "processing"
+            job.started_at = datetime.now(timezone.utc).isoformat()
+            job.start_time = total_start_time
+
+        def read_mpp(key):
+            try:
+                val = float(slide.properties.get(key))
+                return val if math.isfinite(val) and val > 0 else None
+            except Exception:
+                return None
+
+        mpp_x = read_mpp(openslide.PROPERTY_NAME_MPP_X)
+        mpp_y = read_mpp(openslide.PROPERTY_NAME_MPP_Y)
+
+        with closing(connect_func()) as db:
+            cal_row = db.execute(
+                "SELECT TOP 1 pixel_size_microns FROM image_versions WHERE slide_id = ? ORDER BY version DESC",
+                (slide_id,),
+            ).fetchone()
+            if cal_row and cal_row.get("pixel_size_microns"):
+                if mpp_x is None:
+                    mpp_x = float(cal_row["pixel_size_microns"])
+                if mpp_y is None:
+                    mpp_y = float(cal_row["pixel_size_microns"])
+
+        if mpp_x is None or mpp_x <= 0 or mpp_y is None or mpp_y <= 0:
+            raise ValueError("KongNet requires valid slide MPP calibration; configure slide calibration before inference.")
+
+        level0_x, level0_y, w, h, roi_array, auto_detected, tissue_pct = extract_roi(
+            slide=slide,
+            x=eff_x,
+            y=eff_y,
+            width=eff_w,
+            height=eff_h,
+            level=level,
+        )
+
+        job_id_str = job.job_id if job else uuid.uuid4().hex[:12]
+        roi_filename = f"roi_s{slide_id}_{job_id_str}.png"
+        roi_path = save_roi_image(roi_array, roi_filename)
+
+        eff_target_mpp = target_mpp if target_mpp is not None else 0.25
+        eff_threshold = threshold if threshold is not None else 0.50
+
+        tile_info = calculate_kongnet_tiles(w, h, mpp_x, mpp_y, target_mpp=eff_target_mpp)
+        total_tiles = tile_info["total_tiles"]
+        if job:
+            job.total_patches = total_tiles
+            job.estimated_seconds = tile_info["estimated_seconds"]
+
+        def on_progress(p: dict):
+            if job:
+                job.processed_patches = p.get("processed_patches", job.processed_patches)
+                job.total_patches = p.get("total_patches", job.total_patches)
+                job.percent = p.get("percent", job.percent)
+                job.elapsed_str = p.get("elapsed_str", job.elapsed_str)
+                job.remaining_str = p.get("remaining_str", job.remaining_str)
+                if job.start_time:
+                    job.elapsed_seconds = time.time() - job.start_time
+
+        cancel_ev = job.cancel_event if job else None
+
+        infer_start = time.time()
+        logger.info("KongNet inference starting on slide %s ROI (%d, %d, %d, %d)...", slide_id, level0_x, level0_y, w, h)
+        try:
+            worker_payload = {
+                "slide_path": str(slide_path),
+                "image_path": str(roi_path),
+                "roi": {"x": level0_x, "y": level0_y, "width": w, "height": h},
+                "mpp_x": mpp_x,
+                "mpp_y": mpp_y,
+                "target_mpp": eff_target_mpp,
+                "threshold": eff_threshold,
+                "tta": tta,
+            }
+            inference_result = kongnet_manager.run_inference(
+                request_payload=worker_payload,
+                progress_callback=on_progress if job else None,
+                cancel_event=cancel_ev,
+            )
+        except InterruptedError:
+            if job:
+                job.status = "cancelled"
+                job.error = "Analysis cancelled by user."
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+            raise
+        except TimeoutError as exc:
+            if job:
+                job.status = "timeout"
+                job.error = str(exc)
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+            raise
+        except Exception as inf_exc:
+            logger.error("KongNet inference error on slide %s: %s", slide_id, inf_exc)
+            if job:
+                job.status = "failed"
+                job.error = str(inf_exc)
+                job.completed_at = datetime.now(timezone.utc).isoformat()
+            raise
+
+        infer_elapsed = time.time() - infer_start
+        logger.info("KongNet inference completed in %.2fs", infer_elapsed)
+
+        detections = inference_result.get("detections", [])
+        summary = inference_result.get("summary", {})
+
+        gallery_data = extract_candidate_crops(
+            slide_or_roi_path=slide_path,
+            detections=detections,
+            slide_id=slide_id,
+            analysis_id_str=job_id_str,
+            roi_x=level0_x,
+            roi_y=level0_y,
+            crop_size=120,
+            is_wsi=True,
+        )
+
+        overlay_filename = f"overlay_s{slide_id}_{job_id_str}.png"
+        overlay_path, _ = create_mitotic_overlay_image(roi_path, detections, overlay_filename)
+
+        report_filename = f"ai_report_s{slide_id}_{job_id_str}.pdf"
+        report_path = AI_REPORT_DIR / report_filename
+        roi_meta = {
+            "x": level0_x,
+            "y": level0_y,
+            "width": w,
+            "height": h,
+            "level": level,
+            "auto_detected": auto_detected,
+            "tissue_percentage": tissue_pct,
+            "feature_code": feature_code,
+        }
+
+        try:
+            build_kongnet_pdf(
+                output_path=report_path,
+                slide_id=slide_id,
+                case_identifier=case_row["case_id"],
+                slide_filename=slide_row["filename"],
+                roi_info=roi_meta,
+                summary=summary,
+                detections=detections,
+                gallery=gallery_data,
+                roi_image_path=roi_path,
+                overlay_image_path=overlay_path,
+            )
+        except Exception as pdf_exc:
+            logger.warning("KongNet PDF report generation failed: %s", pdf_exc)
+            report_filename = None
+
+        analysis_id = save_kongnet_analysis_record(
+            connect_func=connect_func,
+            slide_row=slide_row,
+            case_row=case_row,
+            user_username=current_username,
+            roi_info=roi_meta,
+            summary=summary,
+            detections=detections,
+            gallery=gallery_data,
+            roi_filename=roi_filename,
+            overlay_filename=overlay_filename,
+            report_filename=report_filename,
+        )
+
+        for item in gallery_data.get("items", []):
+            item["image_url"] = f"/api/ai/analyses/{analysis_id}/gallery/{item['filename']}"
+
+        total_elapsed = time.time() - (job.start_time if job and job.start_time else total_start_time)
+
+        response = {
+            "id": analysis_id,
+            "slide_id": slide_id,
+            "case_id": case_row["id"],
+            "case_identifier": case_row["case_id"],
+            "model_name": KONGNET_MODEL_NAME,
+            "model_version": KONGNET_MODEL_VERSION,
+            "feature_code": KONGNET_FEATURE_CODE,
+            "status": "completed",
+            "disclaimer": DISCLAIMER_TEXT,
+            "candidate_count": summary.get("candidate_count", len(detections)),
+            "total_nuclei": summary.get("candidate_count", len(detections)),
+            "analyzed_area_mm2": summary.get("analyzed_area_mm2"),
+            "candidate_density_per_mm2": summary.get("candidate_density_per_mm2"),
+            "nuclear_density": summary.get("candidate_density_per_mm2"),
+            "min_score": summary.get("min_score"),
+            "mean_score": summary.get("mean_score"),
+            "max_score": summary.get("max_score"),
+            "threshold": summary.get("threshold"),
+            "confidence_summary": {
+                "mean": summary.get("mean_score"),
+                "median": summary.get("mean_score"),
+                "min": summary.get("min_score"),
+                "max": summary.get("max_score"),
+            },
+            "detections": detections,
+            "gallery": gallery_data,
+            "candidate_gallery": gallery_data,
+            "roi": {
+                "x": level0_x,
+                "y": level0_y,
+                "width": w,
+                "height": h,
+                "roi_x": level0_x,
+                "roi_y": level0_y,
+                "roi_width": w,
+                "roi_height": h,
+                "level": level,
+                "auto_detected": auto_detected,
+                "tissue_percentage": tissue_pct,
+            },
+            "roi_url": f"/api/ai/analyses/{analysis_id}/roi.png",
+            "overlay_url": f"/api/ai/analyses/{analysis_id}/overlay.png",
+            "report_url": f"/api/ai/analyses/{analysis_id}/report.pdf" if report_filename else None,
+            "execution_time_seconds": round(total_elapsed, 2),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        if job:
+            job.status = "completed"
+            job.analysis_id = analysis_id
+            job.result = response
+            job.percent = 100
+            job.processed_patches = total_tiles
+            job.completed_at = datetime.now(timezone.utc).isoformat()
+            job.elapsed_seconds = total_elapsed
+
+        return response
+
     @router.get("/api/slides/{slide_id}/ai/estimate")
     def estimate_ai_analysis_patches(
         slide_id: int,
@@ -412,7 +679,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         # The viewer sends its selected catalog feature. HoVer-Net is currently
         # the only executable slide-analysis engine, and entitlement is checked
         # again on the server before work is created.
-        if req.feature_code != HOVERNET:
+        if req.feature_code not in (HOVERNET, MITOTIC_DETECTION):
             raise HTTPException(422, "The selected AI feature is not available in the slide viewer.")
         subscriptions.require_entitlement(current_user, req.feature_code)
 
@@ -438,8 +705,8 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                     str(slide_id),
                     json.dumps({
                         "feature_code": req.feature_code,
-                        "model_name": MODEL_NAME,
-                        "model_version": MODEL_VERSION,
+                        "model_name": KONGNET_MODEL_NAME if req.feature_code == MITOTIC_DETECTION else MODEL_NAME,
+                        "model_version": KONGNET_MODEL_VERSION if req.feature_code == MITOTIC_DETECTION else MODEL_VERSION,
                         "case_id": case_row["id"],
                         "roi": {"x": eff_x, "y": eff_y, "width": eff_w, "height": eff_h, "level": req.level},
                         "auto_tissue": req.auto_tissue,
@@ -463,7 +730,109 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                 slide.close()
                 raise HTTPException(status_code=400, detail=err)
 
-        # 2. Calculate patch requirements
+        # 2. KongNet vs HoVer-Net routing
+        if req.feature_code == MITOTIC_DETECTION:
+            tile_info = calculate_kongnet_tiles(eff_w, eff_h)
+            total_tiles = tile_info["total_tiles"]
+            small_limit = int(os.getenv("KONGNET_SMALL_ROI_TILES", "16"))
+            is_large = total_tiles > small_limit
+
+            if is_large or req.run_in_background:
+                job = ai_job_manager.create_job(
+                    slide_id=slide_id,
+                    case_id=case_row["id"],
+                    requested_by=current_user["username"],
+                    roi_info={
+                        "x": eff_x,
+                        "y": eff_y,
+                        "width": eff_w,
+                        "height": eff_h,
+                        "level": req.level,
+                        "auto_tissue": req.auto_tissue,
+                    },
+                    total_patches=total_tiles,
+                    estimated_seconds=tile_info["estimated_seconds"],
+                )
+
+                def _bg_kongnet_runner():
+                    try:
+                        _execute_kongnet_pipeline(
+                            slide_row=slide_row,
+                            case_row=case_row,
+                            current_username=current_user["username"],
+                            eff_x=eff_x,
+                            eff_y=eff_y,
+                            eff_w=eff_w,
+                            eff_h=eff_h,
+                            level=req.level,
+                            auto_tissue=req.auto_tissue,
+                            feature_code=req.feature_code,
+                            slide=slide,
+                            slide_path=slide_path,
+                            threshold=req.threshold,
+                            target_mpp=req.target_mpp,
+                            tta=req.tta,
+                            job=job,
+                        )
+                    except Exception as exc:
+                        logger.exception("Background KongNet inference job %s failed: %s", job.job_id, exc)
+                    finally:
+                        try:
+                            slide.close()
+                        except Exception:
+                            pass
+
+                t = threading.Thread(target=_bg_kongnet_runner, daemon=True, name=f"KongNetJobWorker-{job.job_id}")
+                t.start()
+
+                response.status_code = status.HTTP_202_ACCEPTED
+                return {
+                    "job_id": job.job_id,
+                    "id": job.job_id,
+                    "status": "processing",
+                    "is_background": True,
+                    "total_patches": total_tiles,
+                    "estimated_seconds": tile_info["estimated_seconds"],
+                    "message": f"KongNet mitosis detection started in background ({total_tiles} tiles).",
+                }
+
+            try:
+                result = _execute_kongnet_pipeline(
+                    slide_row=slide_row,
+                    case_row=case_row,
+                    current_username=current_user["username"],
+                    eff_x=eff_x,
+                    eff_y=eff_y,
+                    eff_w=eff_w,
+                    eff_h=eff_h,
+                    level=req.level,
+                    auto_tissue=req.auto_tissue,
+                    feature_code=req.feature_code,
+                    slide=slide,
+                    slide_path=slide_path,
+                    threshold=req.threshold,
+                    target_mpp=req.target_mpp,
+                    tta=req.tta,
+                    job=None,
+                )
+                response.status_code = status.HTTP_200_OK
+                return result
+            except InterruptedError:
+                raise HTTPException(status_code=409, detail="AI analysis was cancelled.")
+            except TimeoutError as exc:
+                raise HTTPException(status_code=504, detail=f"KongNet analysis timed out: {exc}")
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            except Exception as exc:
+                logger.exception("Synchronous KongNet analysis failed: %s", exc)
+                raise HTTPException(status_code=500, detail=f"KongNet inference failed: {exc}")
+            finally:
+                try:
+                    slide.close()
+                except Exception:
+                    pass
+
+        # 3. Calculate patch requirements (HoVer-Net)
         patch_info = calculate_hovernet_patches(eff_w, eff_h)
         total_patches = patch_info["total_patches"]
         small_limit = int(os.getenv("HOVERNET_SMALL_ROI_PATCHES", "25"))
@@ -598,6 +967,12 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                 "Non-neoplastic": d.get("non_neoplastic_count", 0),
                 "No label": d.get("no_label_count", 0),
             }
+            is_kongnet = (d.get("model_name") == KONGNET_MODEL_NAME or (summary and summary.get("feature_code") == KONGNET_FEATURE_CODE))
+            d["feature_code"] = KONGNET_FEATURE_CODE if is_kongnet else (summary and summary.get("feature_code")) or HOVERNET
+            if is_kongnet:
+                d["candidate_count"] = summary.get("candidate_count", d.get("total_nuclei", 0)) if summary else d.get("total_nuclei", 0)
+                d["candidate_density_per_mm2"] = summary.get("candidate_density_per_mm2", d.get("nuclear_density")) if summary else d.get("nuclear_density")
+                d["analyzed_area_mm2"] = summary.get("analyzed_area_mm2") if summary else None
             d["morphology"] = (summary and summary.get("morphology")) or {}
             d["confidence_summary"] = {"mean": d.get("avg_confidence")}
             d["roi"] = {
@@ -626,6 +1001,68 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         summary = json.loads(d.pop("summary_json") or "{}")
         predictions = json.loads(d.pop("predictions_json") or "{}")
         gallery = json.loads(d.pop("gallery_json") or "{}")
+
+        is_kongnet = (d.get("model_name") == KONGNET_MODEL_NAME or summary.get("feature_code") == KONGNET_FEATURE_CODE)
+        if is_kongnet:
+            detections = predictions.get("detections", [])
+            for item in gallery.get("items", []):
+                item["image_url"] = f"/api/ai/analyses/{analysis_id}/gallery/{item['filename']}"
+
+            cand_cnt = summary.get("candidate_count", len(detections))
+            cand_density = summary.get("candidate_density_per_mm2", d.get("nuclear_density"))
+            mean_score = summary.get("mean_score", d.get("avg_confidence"))
+            return {
+                "id": d["id"],
+                "slide_id": d["slide_id"],
+                "case_id": d["case_id"],
+                "requested_by": d["requested_by"],
+                "model_name": KONGNET_MODEL_NAME,
+                "model_version": d.get("model_version") or KONGNET_MODEL_VERSION,
+                "feature_code": KONGNET_FEATURE_CODE,
+                "status": "completed",
+                "disclaimer": d.get("disclaimer") or DISCLAIMER_TEXT,
+                "created_at": d["created_at"],
+                "completed_at": d["completed_at"],
+                "total_nuclei": cand_cnt,
+                "candidate_count": cand_cnt,
+                "candidate_density_per_mm2": cand_density,
+                "nuclear_density": cand_density,
+                "analyzed_area_mm2": summary.get("analyzed_area_mm2"),
+                "threshold": summary.get("threshold"),
+                "min_score": summary.get("min_score"),
+                "mean_score": mean_score,
+                "max_score": summary.get("max_score"),
+                "confidence_summary": {
+                    "mean": mean_score,
+                    "min": summary.get("min_score"),
+                    "max": summary.get("max_score"),
+                },
+                "detections": detections,
+                "gallery": gallery,
+                "candidate_gallery": gallery,
+                "roi_x": d["roi_x"],
+                "roi_y": d["roi_y"],
+                "roi_width": d["roi_width"],
+                "roi_height": d["roi_height"],
+                "roi": {
+                    "x": d["roi_x"],
+                    "y": d["roi_y"],
+                    "width": d["roi_width"],
+                    "height": d["roi_height"],
+                    "roi_x": d["roi_x"],
+                    "roi_y": d["roi_y"],
+                    "roi_width": d["roi_width"],
+                    "roi_height": d["roi_height"],
+                    "level": d["roi_level"],
+                    "image_url": f"/api/ai/analyses/{analysis_id}/roi.png",
+                },
+                "overlay": {
+                    "image_url": f"/api/ai/analyses/{analysis_id}/overlay.png",
+                },
+                "summary": summary,
+                "predictions": predictions,
+                "report_url": f"/api/ai/analyses/{analysis_id}/report.pdf" if d.get("report_pdf_filename") else None,
+            }
 
         nuclei_list = list(predictions.values())
         breakdown = summary.get("classification_breakdown") or {
@@ -729,12 +1166,38 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         filename: str,
         current_user=Depends(require_roles_func(ai_read_roles)),
     ):
-        if not re.fullmatch(r"type_[0-5]_[0-9]{2}\.png", filename):
-            raise HTTPException(400, "Invalid crop thumbnail identifier")
-
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
         _authorize_analysis(row, current_user)
+
+        # KongNet crops are stored under backend/storage/ai/galleries, while
+        # HoVer-Net galleries use the independent ai_engine storage root.
+        # Preserve the analysis-specific filename allowlist before serving.
+        if filename.startswith("cand_s") and re.fullmatch(
+            r"cand_s\d+_[a-zA-Z0-9_\-]+\.png", filename
+        ):
+            gallery_metadata = json.loads(row.get("gallery_json") or "{}")
+            allowed_files = {
+                item.get("filename")
+                for item in gallery_metadata.get("items", [])
+                if isinstance(item, dict)
+            }
+            if filename not in allowed_files:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Candidate crop does not belong to this analysis",
+                )
+
+            gallery_root = KONGNET_GALLERY_DIR.resolve()
+            path = (gallery_root / filename).resolve()
+            if gallery_root not in path.parents:
+                raise HTTPException(status_code=400, detail="Invalid candidate crop path")
+            if not path.is_file():
+                raise HTTPException(status_code=404, detail="Candidate crop image not found")
+            return FileResponse(path, media_type="image/png")
+
+        if not re.fullmatch(r"type_[0-5]_[0-9]{2}\.png", filename):
+            raise HTTPException(400, "Invalid crop thumbnail identifier")
 
         gallery = json.loads(row.get("gallery_json") or "{}")
         gallery_id = gallery.get("gallery_id")
@@ -771,7 +1234,25 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         report_filename = f"ai_report_s{row['slide_id']}_{analysis_id}_{uuid.uuid4().hex[:8]}.pdf"
         report_path = AI_REPORT_DIR / report_filename
 
-        build_color_ai_pdf(
+        is_kongnet = (row.get("model_name") == KONGNET_MODEL_NAME or summary.get("feature_code") == KONGNET_FEATURE_CODE)
+        if is_kongnet:
+            predictions = json.loads(row.get("predictions_json") or "{}")
+            slide_row = get_slide_func(row["slide_id"])
+            build_kongnet_pdf(
+                output_path=report_path,
+                slide_id=row["slide_id"],
+                case_identifier=case_row["case_id"],
+                slide_filename=slide_row["filename"],
+                roi_info=roi_meta,
+                summary=summary.get("summary", summary),
+                detections=predictions.get("detections", []),
+                gallery=gallery,
+                roi_image_path=roi_path,
+                overlay_image_path=overlay_path,
+                analysis_id=analysis_id,
+            )
+        else:
+            build_color_ai_pdf(
             output_path=report_path,
             slide_id=row["slide_id"],
             case_identifier=case_row["case_id"],
@@ -824,23 +1305,41 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
             filename = f"ai_report_s{row['slide_id']}_{analysis_id}.pdf"
             report_path = AI_REPORT_DIR / filename
 
-            build_color_ai_pdf(
-                output_path=report_path,
-                slide_id=row["slide_id"],
-                case_identifier=case_row["case_id"],
-                roi_path=roi_path,
-                overlay_path=overlay_path,
-                analysis={
-                    "total_nuclei": row["total_nuclei"],
-                    "type_summary": summary.get("type_summary", {}),
-                    "morphology": summary.get("morphology", {}),
-                    "nuclear_density_per_mm2": row["nuclear_density"],
-                },
-                score_stats=summary.get("confidence_statistics", {}),
-                gallery=gallery,
-                roi_info=roi_meta,
-                model_name=f"{row['model_name']} ({row['model_version']})",
-            )
+            is_kongnet = (row.get("model_name") == KONGNET_MODEL_NAME or summary.get("feature_code") == KONGNET_FEATURE_CODE)
+            if is_kongnet:
+                predictions = json.loads(row.get("predictions_json") or "{}")
+                slide_row = get_slide_func(row["slide_id"])
+                build_kongnet_pdf(
+                    output_path=report_path,
+                    slide_id=row["slide_id"],
+                    case_identifier=case_row["case_id"],
+                    slide_filename=slide_row["filename"],
+                    roi_info=roi_meta,
+                    summary=summary.get("summary", summary),
+                    detections=predictions.get("detections", []),
+                    gallery=gallery,
+                    roi_image_path=roi_path,
+                    overlay_image_path=overlay_path,
+                    analysis_id=analysis_id,
+                )
+            else:
+                build_color_ai_pdf(
+                    output_path=report_path,
+                    slide_id=row["slide_id"],
+                    case_identifier=case_row["case_id"],
+                    roi_path=roi_path,
+                    overlay_path=overlay_path,
+                    analysis={
+                        "total_nuclei": row["total_nuclei"],
+                        "type_summary": summary.get("type_summary", {}),
+                        "morphology": summary.get("morphology", {}),
+                        "nuclear_density_per_mm2": row["nuclear_density"],
+                    },
+                    score_stats=summary.get("confidence_statistics", {}),
+                    gallery=gallery,
+                    roi_info=roi_meta,
+                    model_name=f"{row['model_name']} ({row['model_version']})",
+                )
             with closing(connect_func()) as db:
                 db.execute("UPDATE ai_analyses SET report_pdf_filename = ? WHERE id = ?", (filename, analysis_id))
                 db.commit()

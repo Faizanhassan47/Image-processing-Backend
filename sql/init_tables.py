@@ -49,6 +49,7 @@ def init_db(connect_fn):
         """)
         feature_seeds = [
             ('HOVERNET', 'HoVer-Net', 'Detects and segments cell nuclei, classifies nuclear types, and provides counts, density, and morphology measurements.', 1),
+            ('MITOTIC_DETECTION', 'KongNet-Det', 'Detects candidate mitotic figures using KongNet-Det, provides mitotic candidate count, spatial density per mm², and confidence scores.', 1),
             ('IMAGE_QC', 'Image Quality Control', 'Evaluates image quality, including blur, focus problems, tissue folds, and artifacts.', 0),
             ('TUMOR_DETECTION', 'Tumor Detection', 'Identifies candidate tumor-containing regions for research review.', 0),
             ('TISSUE_SEGMENTATION', 'Tissue Segmentation', 'Identifies tissue structures and regions, such as stroma and epithelium, when supported by an appropriate model.', 0),
