@@ -27,6 +27,12 @@ WHEN NOT MATCHED THEN INSERT(feature_code,feature_name,description,is_implemente
 VALUES(source.feature_code,source.feature_name,source.description,source.is_implemented,1);
 GO
 
+-- KongNet-Det is implemented and available once its engine is installed.
+UPDATE ai_features
+SET is_implemented = 1, is_active = 1
+WHERE feature_code = 'MITOTIC_DETECTION';
+GO
+
 IF OBJECT_ID('user_subscriptions','U') IS NULL
 CREATE TABLE user_subscriptions (
  id INT IDENTITY(1,1) PRIMARY KEY, user_id INT NOT NULL REFERENCES users(id), plan_name VARCHAR(120) NOT NULL,
