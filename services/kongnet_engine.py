@@ -960,6 +960,7 @@ def init_kongnet_schema(connect_func):
             ELSE
             UPDATE ai_features SET
                 is_implemented = 1,
+                is_active = 1,
                 catalog_title = COALESCE(catalog_title, 'KongNet-Det — Mitotic Figure Detection')
             WHERE feature_code = 'MITOTIC_DETECTION'"""
         )
