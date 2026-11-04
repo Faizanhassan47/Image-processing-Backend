@@ -48,6 +48,16 @@ from services.ai_engine import (
     validate_roi_dimensions,
 )
 from services.ai_subscription_service import AISubscriptionService, HOVERNET, MITOTIC_DETECTION
+from services.camelyon_engine import (
+    FEATURE_CODE as CAMELYON_FEATURE_CODE,
+    MODEL_NAME as CAMELYON_MODEL_NAME,
+    MODEL_VERSION as CAMELYON_MODEL_VERSION,
+    DISCLAIMER as CAMELYON_DISCLAIMER,
+    calculate_camelyon_patches,
+    run_camelyon_inference,
+    run_camelyon_whole_slide,
+    save_camelyon_analysis_record,
+)
 from services.kongnet_engine import (
     kongnet_manager,
     calculate_kongnet_tiles,
@@ -610,6 +620,93 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
 
         return response
 
+    def _camelyon_progress(job, progress):
+        total = int(progress.get('total') or 0)
+        current = int(progress.get('current') or 0)
+        if total:
+            job.total_patches = total
+        job.processed_patches = current
+        try:
+            job.percent = float(progress.get('percentage') or 0)
+        except (TypeError, ValueError):
+            job.percent = 0
+
+    def _camelyon_job_result(analysis_id, slide_row, case_row, result):
+        return {
+            'id': analysis_id, 'slide_id': slide_row['id'], 'case_id': case_row['id'],
+            'feature_code': CAMELYON_FEATURE_CODE, 'model_name': CAMELYON_MODEL_NAME,
+            'model_version': CAMELYON_MODEL_VERSION, 'status': 'completed',
+            'analysis_mode': result.get('analysis_mode', 'roi'),
+            'patch_count': result['patch_count'],
+            'eligible_patch_count': result.get('eligible_patch_count', result['patch_count']),
+            'partial_coverage': bool(result.get('partial_coverage')),
+            'coverage_fraction': result.get('coverage_fraction', 1.0),
+            'mean_score': result['mean_score'],
+            'min_score': result['min_score'], 'max_score': result['max_score'],
+            'roi': result['roi'],
+            'summary': {
+                'feature_code': CAMELYON_FEATURE_CODE,
+                'analysis_mode': result.get('analysis_mode', 'roi'),
+                'patch_count': result['patch_count'],
+                'eligible_patch_count': result.get('eligible_patch_count', result['patch_count']),
+                'partial_coverage': bool(result.get('partial_coverage')),
+                'coverage_fraction': result.get('coverage_fraction', 1.0),
+                'mean_score': result['mean_score'],
+                'min_score': result['min_score'],
+                'max_score': result['max_score'],
+            },
+            'roi_url': f'/api/ai/analyses/{analysis_id}/roi.png',
+            'overlay_url': f'/api/ai/analyses/{analysis_id}/overlay.png',
+            'disclaimer': CAMELYON_DISCLAIMER,
+        }
+
+    def _execute_camelyon_pipeline(*, slide_row, case_row, username, slide_path, x, y,
+                                   width, height, job, whole_slide=False):
+        if job.cancel_event.is_set():
+            return
+        job.status = 'processing'
+        job.started_at = datetime.now(timezone.utc).isoformat()
+        job.start_time = time.time()
+        try:
+            if whole_slide:
+                result = run_camelyon_whole_slide(
+                    slide_path=slide_path, job_id=job.job_id, cancel_event=job.cancel_event,
+                    progress_callback=lambda progress: _camelyon_progress(job, progress),
+                )
+            else:
+                result = run_camelyon_inference(
+                    slide_path=slide_path, x=x, y=y, width=width, height=height,
+                    job_id=job.job_id, cancel_event=job.cancel_event,
+                    progress_callback=lambda progress: _camelyon_progress(job, progress),
+                )
+            if job.cancel_event.is_set():
+                raise InterruptedError('CAMELYON analysis cancelled')
+            analysis_id = save_camelyon_analysis_record(
+                connect_func=connect_func, slide_row=slide_row,
+                case_row=case_row, requested_by=username,
+                result=result, roi_image_dir=AI_ROI_DIR,
+            )
+            job.analysis_id = analysis_id
+            job.result = _camelyon_job_result(analysis_id, slide_row, case_row, result)
+            if not job.cancel_event.is_set():
+                job.processed_patches = result['patch_count']
+                job.percent = 100
+                job.status = 'completed'
+        except InterruptedError:
+            job.status = 'cancelled'
+            job.error = 'Analysis cancelled by user.'
+        except TimeoutError as exc:
+            job.status = 'timeout'
+            job.error = str(exc)
+            logger.exception('CAMELYON job %s timed out', job.job_id)
+        except Exception as exc:
+            job.status = 'failed'
+            job.error = str(exc)
+            logger.exception('CAMELYON job %s failed', job.job_id)
+        finally:
+            job.completed_at = datetime.now(timezone.utc).isoformat()
+            job.elapsed_seconds = time.time() - job.start_time if job.start_time else 0.0
+
     @router.get("/api/slides/{slide_id}/ai/estimate")
     def estimate_ai_analysis_patches(
         slide_id: int,
@@ -679,9 +776,14 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         # The viewer sends its selected catalog feature. HoVer-Net is currently
         # the only executable slide-analysis engine, and entitlement is checked
         # again on the server before work is created.
-        if req.feature_code not in (HOVERNET, MITOTIC_DETECTION):
+        if req.feature_code not in (HOVERNET, MITOTIC_DETECTION, CAMELYON_FEATURE_CODE):
             raise HTTPException(422, "The selected AI feature is not available in the slide viewer.")
         subscriptions.require_entitlement(current_user, req.feature_code)
+        if req.feature_code == CAMELYON_FEATURE_CODE:
+            if req.level != 0:
+                raise HTTPException(400, "CAMELYON requires level-0 coordinates")
+            if any(value is not None for value in (req.threshold, req.target_mpp)) or req.tta:
+                raise HTTPException(400, "CAMELYON does not support threshold, target_mpp, or TTA parameters")
 
         slide_path = stored_path_func(slide_row["filename"])
         if not slide_path.is_file():
@@ -705,8 +807,8 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                     str(slide_id),
                     json.dumps({
                         "feature_code": req.feature_code,
-                        "model_name": KONGNET_MODEL_NAME if req.feature_code == MITOTIC_DETECTION else MODEL_NAME,
-                        "model_version": KONGNET_MODEL_VERSION if req.feature_code == MITOTIC_DETECTION else MODEL_VERSION,
+                        "model_name": CAMELYON_MODEL_NAME if req.feature_code == CAMELYON_FEATURE_CODE else (KONGNET_MODEL_NAME if req.feature_code == MITOTIC_DETECTION else MODEL_NAME),
+                        "model_version": CAMELYON_MODEL_VERSION if req.feature_code == CAMELYON_FEATURE_CODE else (KONGNET_MODEL_VERSION if req.feature_code == MITOTIC_DETECTION else MODEL_VERSION),
                         "case_id": case_row["id"],
                         "roi": {"x": eff_x, "y": eff_y, "width": eff_w, "height": eff_h, "level": req.level},
                         "auto_tissue": req.auto_tissue,
@@ -730,6 +832,72 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                 slide.close()
                 raise HTTPException(status_code=400, detail=err)
 
+        # CAMELYON always runs as a background job. auto_tissue scans the whole slide.
+        if req.feature_code == CAMELYON_FEATURE_CODE and req.auto_tissue:
+            suffix = Path(slide_row["filename"]).suffix.lower()
+            if suffix not in {".svs", ".tif", ".tiff"}:
+                slide.close()
+                raise HTTPException(400, "Whole-slide CAMELYON supports SVS and TIFF slides")
+            job = ai_job_manager.create_job(
+                slide_id=slide_id, case_id=case_row['id'],
+                requested_by=current_user['username'],
+                roi_info={'x': 0, 'y': 0, 'width': full_w, 'height': full_h,
+                          'level': 0, 'auto_tissue': True, 'feature_code': CAMELYON_FEATURE_CODE},
+                total_patches=0, estimated_seconds=0,
+                feature_code=CAMELYON_FEATURE_CODE,
+            )
+            slide.close()
+            threading.Thread(
+                target=_execute_camelyon_pipeline,
+                kwargs={'slide_row': slide_row, 'case_row': case_row,
+                        'username': current_user['username'], 'slide_path': slide_path,
+                        'x': 0, 'y': 0, 'width': full_w, 'height': full_h,
+                        'job': job, 'whole_slide': True},
+                daemon=True, name=f'CAMELYONJob-{job.job_id}',
+            ).start()
+            response.status_code = status.HTTP_202_ACCEPTED
+            return {'job_id': job.job_id, 'id': job.job_id, 'status': 'processing',
+                    'is_background': True, 'feature_code': CAMELYON_FEATURE_CODE,
+                    'analysis_mode': 'whole_slide',
+                    'message': 'CAMELYON whole-slide analysis started (research only).'}
+
+        if req.feature_code == CAMELYON_FEATURE_CODE:
+            try:
+                if eff_x is None or eff_y is None:
+                    raise ValueError('CAMELYON requires explicit x/y coordinates')
+                patch_count = calculate_camelyon_patches(eff_w, eff_h)
+                valid, err = validate_roi_dimensions(
+                    eff_w, eff_h, full_w, full_h, eff_x, eff_y,
+                    min_dim=224, max_dim=4480,
+                )
+                if not valid:
+                    raise ValueError(err)
+                job = ai_job_manager.create_job(
+                    slide_id=slide_id, case_id=case_row['id'],
+                    requested_by=current_user['username'],
+                    roi_info={'x': eff_x, 'y': eff_y, 'width': eff_w,
+                              'height': eff_h, 'level': 0, 'feature_code': CAMELYON_FEATURE_CODE},
+                    total_patches=patch_count, estimated_seconds=patch_count * 0.2,
+                    feature_code=CAMELYON_FEATURE_CODE,
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            finally:
+                slide.close()
+            t = threading.Thread(
+                target=_execute_camelyon_pipeline,
+                kwargs={'slide_row': slide_row, 'case_row': case_row,
+                        'username': current_user['username'], 'slide_path': slide_path,
+                        'x': eff_x, 'y': eff_y, 'width': eff_w, 'height': eff_h, 'job': job},
+                daemon=True, name=f'CAMELYONJob-{job.job_id}',
+            )
+            t.start()
+            response.status_code = status.HTTP_202_ACCEPTED
+            return {'job_id': job.job_id, 'id': job.job_id, 'status': 'processing',
+                    'is_background': True, 'feature_code': CAMELYON_FEATURE_CODE,
+                    'total_patches': patch_count,
+                    'message': 'CAMELYON ROI analysis started (research only).'}
+
         # 2. KongNet vs HoVer-Net routing
         if req.feature_code == MITOTIC_DETECTION:
             tile_info = calculate_kongnet_tiles(eff_w, eff_h)
@@ -752,6 +920,7 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
                     },
                     total_patches=total_tiles,
                     estimated_seconds=tile_info["estimated_seconds"],
+                    feature_code=MITOTIC_DETECTION,
                 )
 
                 def _bg_kongnet_runner():
@@ -1002,6 +1171,27 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         predictions = json.loads(d.pop("predictions_json") or "{}")
         gallery = json.loads(d.pop("gallery_json") or "{}")
 
+        if summary.get('feature_code') == CAMELYON_FEATURE_CODE or d.get('model_name') == CAMELYON_MODEL_NAME:
+            return {
+                'id': d['id'], 'slide_id': d['slide_id'], 'case_id': d['case_id'],
+                'requested_by': d['requested_by'], 'status': str(d['status']).lower(),
+                'model_name': CAMELYON_MODEL_NAME, 'model_version': d.get('model_version'),
+                'feature_code': CAMELYON_FEATURE_CODE, 'disclaimer': CAMELYON_DISCLAIMER,
+                'created_at': d['created_at'], 'completed_at': d['completed_at'],
+                'patch_count': summary.get('patch_count'), 'mean_score': summary.get('mean_score'),
+                'min_score': summary.get('min_score'), 'max_score': summary.get('max_score'),
+                'analysis_mode': summary.get('analysis_mode', 'roi'),
+                'eligible_patch_count': summary.get('eligible_patch_count'),
+                'partial_coverage': bool(summary.get('partial_coverage')),
+                'coverage_fraction': summary.get('coverage_fraction'),
+                'roi': {'x': d['roi_x'], 'y': d['roi_y'],
+                        'width': d['roi_width'], 'height': d['roi_height'], 'level': 0,
+                        'image_url': f"/api/ai/analyses/{analysis_id}/roi.png"},
+                'overlay': {'image_url': f"/api/ai/analyses/{analysis_id}/overlay.png"},
+                'summary': summary, 'predictions': predictions,
+                'report_url': None, 'research_only': True,
+            }
+
         is_kongnet = (d.get("model_name") == KONGNET_MODEL_NAME or summary.get("feature_code") == KONGNET_FEATURE_CODE)
         if is_kongnet:
             detections = predictions.get("detections", [])
@@ -1219,6 +1409,9 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
             row = _get_analysis_row(db, analysis_id)
             case_row = _authorize_analysis(row, current_user)
 
+        if row.get("model_name") == CAMELYON_MODEL_NAME:
+            raise HTTPException(409, "CAMELYON PDF reporting is not yet supported")
+
         summary = json.loads(row.get("summary_json") or "{}")
         gallery = json.loads(row.get("gallery_json") or "{}")
         roi_meta = {
@@ -1288,6 +1481,9 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         with closing(connect_func()) as db:
             row = _get_analysis_row(db, analysis_id)
             case_row = _authorize_analysis(row, current_user)
+
+        if row.get("model_name") == CAMELYON_MODEL_NAME:
+            raise HTTPException(409, "CAMELYON PDF reporting is not yet supported")
 
         filename = row.get("report_pdf_filename")
         if not filename or not (AI_REPORT_DIR / filename).is_file():

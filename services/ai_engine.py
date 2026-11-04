@@ -54,19 +54,19 @@ for _dir in (AI_STORAGE, AI_ROI_DIR, AI_GALLERY_DIR, AI_REPORT_DIR):
 HOVERNET_PYTHON = Path(
     os.getenv(
         "HOVERNET_PYTHON",
-        r"E:\digital-pathology\ai\hover_net\hovernet_env\Scripts\python.exe",
+        r"E:\Pathology-Integrated\hovernet\.venv\Scripts\python.exe",
     )
 )
 HOVERNET_WORKER = Path(
     os.getenv(
         "HOVERNET_WORKER",
-        r"E:\digital-pathology\ai\hovernet_worker.py",
+        r"E:\Pathology-Integrated\hovernet\hovernet_worker.py",
     )
 )
 HOVERNET_WORKDIR = Path(
     os.getenv(
         "HOVERNET_WORKDIR",
-        r"E:\digital-pathology\ai\hover_net",
+        r"E:\Pathology-Integrated\hovernet\hover_net",
     )
 )
 
@@ -521,7 +521,9 @@ class AIJob:
         roi_info: dict,
         total_patches: int,
         estimated_seconds: float,
+        feature_code: str = "HOVERNET",
     ):
+        self.feature_code = feature_code
         self.job_id = job_id
         self.slide_id = slide_id
         self.case_id = case_id
@@ -567,7 +569,7 @@ class AIJob:
             if self.processed_patches > 0:
                 stage = f"Analyzing patch {self.processed_patches} of {self.total_patches}..."
             else:
-                stage = "Running HoVer-Net inference..."
+                stage = f"Running {self.feature_code} inference..."
         elif self.status == "completed":
             stage = "Analysis complete"
         elif self.status == "cancelled":
@@ -585,6 +587,7 @@ class AIJob:
         }
 
         return {
+            "feature_code": self.feature_code,
             "job_id": self.job_id,
             "id": self.job_id,
             "slide_id": self.slide_id,
@@ -623,6 +626,7 @@ class AIJobManager:
         roi_info: dict,
         total_patches: int,
         estimated_seconds: float,
+        feature_code: str = "HOVERNET",
     ) -> AIJob:
         with self._lock:
             job_id = f"job-{uuid.uuid4().hex[:12]}"
@@ -634,6 +638,7 @@ class AIJobManager:
                 roi_info=roi_info,
                 total_patches=total_patches,
                 estimated_seconds=estimated_seconds,
+                feature_code=feature_code,
             )
             self._jobs[job_id] = job
             return job
@@ -653,7 +658,9 @@ class AIJobManager:
             job.error = "Analysis cancelled by user."
             job.completed_at = datetime.now(timezone.utc).isoformat()
             job.cancel_event.set()
-            hovernet_manager.cancel_inference()
+            if job.feature_code == "HOVERNET":
+                hovernet_manager.cancel_inference()
+            # KongNet and CAMELYON observe their per-job cancel_event.
             return True
 
 

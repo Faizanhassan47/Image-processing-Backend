@@ -1,4 +1,4 @@
-"""
+﻿"""
 Cases and Slides API.
 Handles:
 - Pathology Cases (CRUD, status, assign reviewer, review notes, review history)
@@ -28,6 +28,7 @@ from core.config import (
     UPLOAD_CHUNK_BYTES,
     WSI_MAX_BYTES,
 )
+
 from core.security import (
     ADMIN_ROLES,
     CLINICAL_READ_ROLES,
@@ -43,6 +44,19 @@ from services.slide_cache import (
     set_cached_tile,
     slide_cache,
 )
+
+
+_CASE_CODE = re.compile(r"CASE-(\d+)\Z", re.IGNORECASE)
+
+
+def next_case_code(existing_ids) -> str:
+    """Return the next CASE-#### identifier that does not collide with existing rows."""
+    highest = 0
+    for value in existing_ids:
+        match = _CASE_CODE.fullmatch(str(value or "").strip())
+        if match:
+            highest = max(highest, int(match.group(1)))
+    return f"CASE-{highest + 1:04d}"
 
 
 class ReviewerChange(BaseModel):
@@ -205,12 +219,17 @@ def create_cases_router(
             raise HTTPException(400, "Uploaded file is empty")
         return written
 
+    # WSI extensions handled via OpenSlide (superset of SVS)
+    _WSI_SUFFIXES = {".svs", ".tif", ".tiff"}
+    _RASTER_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
     async def validate_and_store(upload: UploadFile):
         suffix = Path(upload.filename or "").suffix.lower()
-        if suffix not in {".jpg", ".jpeg", ".png", ".svs"}:
+        if suffix not in _RASTER_SUFFIXES | _WSI_SUFFIXES:
             await upload.close()
-            raise HTTPException(400, "Upload a JPG, PNG, or Aperio SVS file")
-        if suffix == ".svs" and openslide is None:
+            raise HTTPException(400, "Upload a JPG, PNG, SVS, or TIFF file")
+        is_wsi = suffix in _WSI_SUFFIXES
+        if is_wsi and openslide is None:
             await upload.close()
             raise HTTPException(503, "WSI upload requires OpenSlide. Install openslide-python or configure OPENSLIDE_PATH.")
         # Storage Guard: Prevent ingestion if storage free space is critically low (< 256 MB)
@@ -227,7 +246,7 @@ def create_cases_router(
         filename = f"{uuid4().hex}{suffix}"
         path = stored_path_fn(filename)
         try:
-            await _save_stream(upload, path, WSI_MAX_BYTES if suffix == ".svs" else RASTER_MAX_BYTES)
+            await _save_stream(upload, path, WSI_MAX_BYTES if is_wsi else RASTER_MAX_BYTES)
             validation = validate_image_file(path, openslide)
         except ImageValidationError as exc:
             path.unlink(missing_ok=True)
@@ -374,7 +393,8 @@ def create_cases_router(
     @router.get("/api/cases/next-id", dependencies=[Depends(require_roles(INTAKE_ROLES))])
     def next_case_id():
         with closing(connect()) as db:
-            return {"case_id": _next_case_id(db)}
+            rows = db.execute("SELECT case_id FROM cases").fetchall()
+        return {"case_id": next_case_code(row["case_id"] for row in rows)}
 
     @router.get("/api/cases/{case_pk}", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])
     def case_detail(case_pk: int, current_user: dict = Depends(get_current_user)):
