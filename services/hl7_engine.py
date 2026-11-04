@@ -146,7 +146,7 @@ def validate_hl7_structure(parsed: dict[str, Any]) -> list[str]:
     msg_type = parsed.get("type_code", "")
 
     # Patient Identification is required for clinical messages
-    if msg_type in {"ADT", "ORM", "ORU"}:
+    if msg_type in {"ADT", "ORM", "OML", "ORU"}:
         if "PID" not in segments or not segments["PID"]:
             errors.append(f"{msg_type} message requires a PID (Patient Identification) segment.")
         else:
@@ -157,7 +157,7 @@ def validate_hl7_structure(parsed: dict[str, Any]) -> list[str]:
                 errors.append("PID segment lacks patient identifier in PID-3 or PID-2.")
 
     # Order messages require ORC / OBR
-    if msg_type == "ORM":
+    if msg_type in {"ORM", "OML"}:
         if "ORC" not in segments and "OBR" not in segments:
             errors.append("ORM message requires an ORC (Common Order) or OBR (Observation Request) segment.")
 
@@ -284,8 +284,8 @@ def extract_canonical_records(parsed: dict[str, Any]) -> dict[str, Any]:
 def generate_hl7_ack(parsed: dict[str, Any], accepted: bool = True, error_msg: str = "") -> str:
     """Generates a standard HL7 v2.5.1 ACK message according to RFC specifications."""
     msh = parsed.get("segments", {}).get("MSH", [[]])[0]
-    rec_app = msh[2] if len(msh) > 2 else "HOSP_LIS"
-    rec_fac = msh[3] if len(msh) > 3 else "CENTRAL_LAB"
+    rec_app = msh[3] if len(msh) > 3 else "HOSP_LIS"
+    rec_fac = msh[4] if len(msh) > 4 else "CENTRAL_LAB"
     ctrl_id = parsed.get("message_control_id", uuid4().hex[:12])
     now_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     ack_ctrl = f"ACK-{uuid4().hex[:8]}"
@@ -299,3 +299,15 @@ def generate_hl7_ack(parsed: dict[str, Any], accepted: bool = True, error_msg: s
         lines.append(f"ERR|^^^100&Segment sequence error&HL70357||E|||||{error_msg.replace('|', '_')}")
 
     return "\r".join(lines)
+
+
+def build_oru_r01(mrn: str, order_id: str, accession: str, diagnosis: str, control_id: str) -> str:
+    """Build a finalized pathology result. Pixel data is not included."""
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    safe_diagnosis = (diagnosis or "Final diagnosis not recorded").replace("\r", " ").replace("|", "/")
+    return "\r".join([
+        f"MSH|^~\\&|DP_PATHOLOGY|LAB_PATH|SIM_LIS|SIM_HOSP|{now_str}||ORU^R01|{control_id}|P|2.5.1",
+        f"PID|1||{mrn}^^^VISTA",
+        f"OBR|1|{order_id}|{accession}|88305^SURGICAL PATHOLOGY^CPT",
+        f"OBX|1|TX|DIAGNOSIS^Final Diagnosis||{safe_diagnosis}",
+    ])

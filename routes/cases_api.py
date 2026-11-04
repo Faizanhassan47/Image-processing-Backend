@@ -35,6 +35,7 @@ from core.security import (
     ROLE_PATHOLOGIST,
 )
 from services.image_validation import ImageValidationError, validate_image_file
+from services.object_storage import delete_case_file, upload_case_file
 from services.slide_cache import (
     DeepZoomGenerator,
     get_cached_tile,
@@ -99,15 +100,28 @@ def create_cases_router(
             raise HTTPException(400, "Case ID must be 1 to 80 characters")
         return val
 
+    def _case_number(value) -> int | None:
+        match = re.fullmatch(r"(?:CASE-)?(\d+)", str(value or "").strip(), re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
     def _next_case_id(db, *, lock=False):
         lock_hint = " WITH (TABLOCKX, HOLDLOCK)" if lock else ""
-        rows = db.execute(f"SELECT case_id FROM cases{lock_hint}").fetchall()
         numbered = []
-        for row in rows:
-            value = str(row["case_id"] or "").strip()
-            match = re.fullmatch(r"(?:CASE-)?(\d+)", value, re.IGNORECASE)
-            if match:
-                numbered.append(int(match.group(1)))
+        for row in db.execute(f"SELECT case_id FROM cases{lock_hint}").fetchall():
+            number = _case_number(row["case_id"])
+            if number is not None:
+                numbered.append(number)
+        for row in db.execute("SELECT accession_number FROM accessions").fetchall():
+            number = _case_number(row["accession_number"])
+            if number is not None:
+                numbered.append(number)
+        for row in db.execute("SELECT details FROM audit_log WHERE action = 'case.delete'").fetchall():
+            try:
+                number = _case_number(json.loads(row["details"] or "{}").get("case_id"))
+            except (TypeError, json.JSONDecodeError):
+                number = None
+            if number is not None:
+                numbered.append(number)
         if not numbered:
             return "CASE-0001"
         return f"CASE-{max(numbered) + 1:04d}"
@@ -158,7 +172,7 @@ def create_cases_router(
 
     def require_wsi_slide(slide_id: int):
         row = get_slide_fn(slide_id)
-        if row["file_type"] != "wsi":
+        if row["file_type"] not in {"wsi", "dicom-wsi"}:
             raise HTTPException(400, "Slide is not a whole-slide image")
         path = stored_path_fn(row["filename"])
         if not path.is_file():
@@ -237,6 +251,24 @@ def create_cases_router(
             raise
         return filename, validation
 
+    def patient_storage_identity(case_pk: int) -> tuple[str | None, str | None]:
+        with closing(connect()) as db:
+            row = db.execute(
+                """SELECT TOP 1 p.cnic, p.display_label
+                   FROM accessions a
+                   JOIN patients p ON p.id = a.patient_id
+                   WHERE a.case_id = ?
+                   ORDER BY a.id DESC""",
+                (case_pk,),
+            ).fetchone()
+        if not row:
+            return None, None
+        return row["cnic"], row["display_label"]
+
+    def publish_slide_file(case_pk: int, filename: str) -> str | None:
+        cnic, patient_name = patient_storage_identity(case_pk)
+        return upload_case_file(stored_path_fn(filename), cnic, filename, patient_name)
+
     async def add_slide_record(case_pk, image, label, stain="", specimen_description="", prepared_slide_id=None, block_id=None):
         get_case_fn(case_pk)
         label = label.strip()
@@ -244,6 +276,12 @@ def create_cases_router(
             raise HTTPException(400, "Slide label must be 1 to 120 characters")
         stored = await validate_and_store(image)
         filename, validation = stored
+        remote_key = None
+        try:
+            remote_key = publish_slide_file(case_pk, filename)
+        except Exception:
+            stored_path_fn(filename).unlink(missing_ok=True)
+            raise
         qc_meta = validation.get("image_qc") or {}
         qc_status_init = "Flagged" if qc_meta.get("qc_status") == "Flagged" else "Passed"
         qc_blur_flag = 1 if not qc_meta.get("is_sharp", True) else 0
@@ -282,6 +320,9 @@ def create_cases_router(
                 row = db.execute("SELECT * FROM slides WHERE id = ?", (cursor.lastrowid,)).fetchone()
         except Exception:
             stored_path_fn(filename).unlink(missing_ok=True)
+            if remote_key:
+                cnic, patient_name = patient_storage_identity(case_pk)
+                delete_case_file(cnic, filename, patient_name)
             raise
         return row
 
@@ -565,8 +606,14 @@ def create_cases_router(
 
     @router.post("/api/slides/{slide_id}/versions", status_code=201, dependencies=[Depends(require_roles(INTAKE_ROLES))])
     async def reimport_slide_version(slide_id: int, image: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
-        get_slide_fn(slide_id)
+        slide = get_slide_fn(slide_id)
         filename, validation = await validate_and_store(image)
+        remote_key = None
+        try:
+            remote_key = publish_slide_file(slide["case_id"], filename)
+        except Exception:
+            stored_path_fn(filename).unlink(missing_ok=True)
+            raise
         try:
             with closing(connect()) as db:
                 previous = db.execute("SELECT TOP 1 version, checksum_sha256 FROM image_versions WHERE slide_id=? ORDER BY version DESC", (slide_id,)).fetchone()
@@ -582,9 +629,12 @@ def create_cases_router(
                 )
                 audit(db, current_user["username"], "image.version_import", "slide", slide_id, f"version={next_version}; image_version_id={cursor.lastrowid}")
                 db.commit()
-            return {"id": cursor.lastrowid, "slide_id": slide_id, "version": next_version, "stored_filename": filename, "validation": validation}
+            return {"id": cursor.lastrowid, "slide_id": slide_id, "version": next_version, "stored_filename": filename, "object_key": remote_key, "validation": validation}
         except Exception:
             stored_path_fn(filename).unlink(missing_ok=True)
+            if remote_key:
+                cnic, patient_name = patient_storage_identity(slide["case_id"])
+                delete_case_file(cnic, filename, patient_name)
             raise
 
     # --- WSI DeepZoom & Image Rendering Endpoints ---

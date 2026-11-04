@@ -51,22 +51,23 @@ AI_REPORT_DIR = AI_STORAGE / "reports"
 for _dir in (AI_STORAGE, AI_ROI_DIR, AI_GALLERY_DIR, AI_REPORT_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
+_AI_MODELS = Path(__file__).resolve().parents[2] / "Ai models" / "hovernet"
 HOVERNET_PYTHON = Path(
     os.getenv(
         "HOVERNET_PYTHON",
-        r"E:\digital-pathology\ai\hover_net\hovernet_env\Scripts\python.exe",
+        str(_AI_MODELS / ".venv" / "Scripts" / "python.exe"),
     )
 )
 HOVERNET_WORKER = Path(
     os.getenv(
         "HOVERNET_WORKER",
-        r"E:\digital-pathology\ai\hovernet_worker.py",
+        str(_AI_MODELS / "hovernet_worker.py"),
     )
 )
 HOVERNET_WORKDIR = Path(
     os.getenv(
         "HOVERNET_WORKDIR",
-        r"E:\digital-pathology\ai\hover_net",
+        str(_AI_MODELS),
     )
 )
 

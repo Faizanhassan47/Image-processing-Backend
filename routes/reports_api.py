@@ -260,6 +260,11 @@ def create_reports_router(connect, require_roles, get_current_user, get_case_fn,
             audit(db, current_user["username"], "report.finalize", "report", report_id, f"case_id={report['case_id']}; version={report['version']}")
             db.commit()
             row = db.execute("SELECT * FROM reports WHERE id = ?", (report_id,)).fetchone()
+        try:
+            from services.hl7_apply import deliver_final_result
+            deliver_final_result(report["case_id"], row.get("diagnosis") or "")
+        except Exception:
+            pass
         return serialize_report(row)
 
     @router.get("/api/reports/{report_id}/pdf", dependencies=[Depends(require_roles(CLINICAL_READ_ROLES))])

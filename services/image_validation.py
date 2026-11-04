@@ -11,7 +11,8 @@ from PIL import Image, UnidentifiedImageError
 
 RASTER_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 WSI_EXTENSIONS = {".svs", ".tif", ".tiff", ".ndpi", ".mrxs", ".scn"}
-SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | WSI_EXTENSIONS
+DICOM_EXTENSIONS = {".dcm", ".dicom"}
+SUPPORTED_EXTENSIONS = RASTER_EXTENSIONS | WSI_EXTENSIONS | DICOM_EXTENSIONS
 
 
 class ImageValidationError(ValueError):
@@ -156,15 +157,22 @@ def _validate_wsi(path: Path, openslide_module) -> dict[str, Any]:
 def validate_image_file(path: Path, openslide_module=None) -> dict[str, Any]:
     path = Path(path)
     suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        raise ImageValidationError(f"Unsupported image format: {suffix or 'no extension'}")
-    if not path.is_file():
-        raise ImageValidationError("Image file does not exist")
-    file_size = path.stat().st_size
-    if file_size < 1:
-        raise ImageValidationError("Image file is empty")
+    if path.is_dir() or suffix in DICOM_EXTENSIONS or (path.is_file() and _looks_like_dicom(path)):
+        from services.dicom_reader import discover_series
 
-    details = _validate_raster(path) if suffix in RASTER_EXTENSIONS else _validate_wsi(path, openslide_module)
+        details = discover_series(path)
+        suffix = suffix or ".dcm"
+    else:
+        if suffix not in SUPPORTED_EXTENSIONS:
+            raise ImageValidationError(f"Unsupported image format: {suffix or 'no extension'}")
+        if not path.is_file():
+            raise ImageValidationError("Image file does not exist")
+        file_size = path.stat().st_size
+        if file_size < 1:
+            raise ImageValidationError("Image file is empty")
+        details = _validate_raster(path) if suffix in RASTER_EXTENSIONS else _validate_wsi(path, openslide_module)
+        details["file_size"] = file_size
+        details["checksum_sha256"] = calculate_sha256(path)
     
     # Run deterministic image QC
     try:
@@ -178,10 +186,17 @@ def validate_image_file(path: Path, openslide_module=None) -> dict[str, Any]:
         "supported": True,
         "integrity": "valid",
         "extension": suffix,
-        "file_size": file_size,
-        "checksum_sha256": calculate_sha256(path),
         "duplicate": False,
         "duplicate_of": None,
         "image_qc": qc_metrics,
     })
     return details
+
+
+def _looks_like_dicom(path: Path) -> bool:
+    try:
+        with path.open("rb") as handle:
+            preamble = handle.read(132)
+    except OSError:
+        return False
+    return len(preamble) >= 132 and preamble[128:132] == b"DICM"

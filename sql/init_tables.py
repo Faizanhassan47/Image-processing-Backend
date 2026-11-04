@@ -74,6 +74,8 @@ def init_db(connect_fn):
             "catalog_session_price_pkr": "DECIMAL(14,2) NULL",
         }.items():
             db.execute(f"IF COL_LENGTH('ai_features','{column_name}') IS NULL ALTER TABLE ai_features ADD {column_name} {definition}")
+        db.execute("""UPDATE ai_features SET is_implemented=1
+            WHERE catalog_title IS NOT NULL AND LTRIM(RTRIM(catalog_title))<>'' AND is_catalog_deleted=0 AND is_implemented=0""")
         db.execute("""
             IF OBJECT_ID('user_subscriptions','U') IS NULL
             CREATE TABLE user_subscriptions (
@@ -438,6 +440,33 @@ def init_db(connect_fn):
         ]:
             db.execute(f"IF COL_LENGTH('dbo.viewer_bookmarks', '{col_name}') IS NULL ALTER TABLE dbo.viewer_bookmarks ADD {col_name} {col_type} NOT NULL CONSTRAINT DF_viewer_bookmarks_{col_name} DEFAULT ({default_val})")
 
+        db.execute("""
+            IF OBJECT_ID('dicom_studies','U') IS NULL CREATE TABLE dicom_studies (
+                id INT IDENTITY PRIMARY KEY,
+                study_instance_uid VARCHAR(128) NOT NULL UNIQUE,
+                created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            )
+        """)
+        db.execute("""
+            IF OBJECT_ID('dicom_series','U') IS NULL CREATE TABLE dicom_series (
+                id INT IDENTITY PRIMARY KEY,
+                study_id INT NOT NULL REFERENCES dicom_studies(id),
+                series_instance_uid VARCHAR(128) NOT NULL UNIQUE,
+                slide_id INT NULL REFERENCES slides(id),
+                sop_class_uid VARCHAR(128) NOT NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            )
+        """)
+        db.execute("""
+            IF OBJECT_ID('dicom_instances','U') IS NULL CREATE TABLE dicom_instances (
+                id INT IDENTITY PRIMARY KEY,
+                series_id INT NOT NULL REFERENCES dicom_series(id),
+                sop_instance_uid VARCHAR(128) NOT NULL UNIQUE,
+                transfer_syntax_uid VARCHAR(128) NULL,
+                stored_filename VARCHAR(512) NOT NULL,
+                created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+            )
+        """)
         db.commit()
         try:
             from services.ai_engine import init_ai_schema

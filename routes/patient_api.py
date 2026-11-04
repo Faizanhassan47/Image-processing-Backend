@@ -13,6 +13,7 @@ from uuid import uuid4
 import pyodbc
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from services.object_storage import delete_case_file, relocate_case_file
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -613,6 +614,8 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
                     shutil.move(str(source), str(destination))
                 except OSError:
                     pass
+            for filename in set(filenames):
+                delete_case_file(patient.get("cnic"), filename, patient.get("display_label"))
 
         return {"message": "Patient profile deleted successfully", "patient_id": patient_id}
 
@@ -651,8 +654,27 @@ def create_patient_router(connect, require_roles, audit, uploads_dir: Path):
             if existing:
                 db.execute("UPDATE accessions SET patient_id=?,accession_number=?,order_id=?,priority=? WHERE id=?", (patient_id,item.accession_number,item.order_id,item.priority,existing["id"])); accession_id=existing["id"]
             else:
-                accession_id=db.execute("INSERT INTO accessions (case_id,patient_id,accession_number,order_id,priority) VALUES (?,?,?,?,?)", (item.case_id,patient_id,item.accession_number,item.order_id,item.priority)).lastrowid
+                orphan = db.execute("SELECT id, case_id FROM accessions WHERE accession_number=?", (item.accession_number,)).fetchone()
+                if orphan and orphan["case_id"] not in (None, item.case_id):
+                    raise HTTPException(409, "Accession number is already used by another case")
+                if orphan:
+                    db.execute("UPDATE accessions SET case_id=?,patient_id=?,order_id=?,priority=? WHERE id=?", (item.case_id,patient_id,item.order_id,item.priority,orphan["id"]))
+                    accession_id = orphan["id"]
+                else:
+                    try:
+                        accession_id=db.execute("INSERT INTO accessions (case_id,patient_id,accession_number,order_id,priority) VALUES (?,?,?,?,?)", (item.case_id,patient_id,item.accession_number,item.order_id,item.priority)).lastrowid
+                    except pyodbc.IntegrityError as exc:
+                        raise HTTPException(409, "Accession number is already used") from exc
             audit(db,user["username"],"patient.case.link","patient",patient_id,json.dumps({"case_id":item.case_id,"accession_id":accession_id})); db.commit()
+            patient = db.execute("SELECT cnic, display_label FROM patients WHERE id=?", (patient_id,)).fetchone()
+            slides = db.execute("SELECT filename FROM slides WHERE case_id=? AND filename IS NOT NULL", (item.case_id,)).fetchall()
+            case_row = db.execute("SELECT filename FROM cases WHERE id=?", (item.case_id,)).fetchone()
+        filenames = [row["filename"] for row in slides if row.get("filename")]
+        if case_row and case_row.get("filename"):
+            filenames.append(case_row["filename"])
+        if patient:
+            for filename in set(filenames):
+                relocate_case_file(filename, patient["cnic"], patient["display_label"])
         return {"id":accession_id,"patient_id":patient_id,**item.model_dump()}
 
     @router.get("/{patient_id}/cases")

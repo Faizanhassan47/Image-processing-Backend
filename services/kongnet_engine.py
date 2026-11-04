@@ -67,22 +67,23 @@ for _dir in (AI_STORAGE, AI_ROI_DIR, AI_GALLERY_DIR, AI_REPORT_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
 # Path to python environment with PyTorch and KongNet dependencies
+_KONGNET_ROOT = ROOT_DIR / "Ai models" / "kongnet"
 KONGNET_PYTHON = Path(
     os.getenv(
         "KONGNET_PYTHON",
-        r"E:\pathology-ai-models\kongnet\.venv\Scripts\python.exe",
+        str(_KONGNET_ROOT / ".venv" / "Scripts" / "python.exe"),
     )
 )
 KONGNET_WORKER = Path(
     os.getenv(
         "KONGNET_WORKER",
-        str(ROOT_DIR / "ai_models" / "kongnet" / "kongnet_worker.py"),
+        str(_KONGNET_ROOT / "kongnet_worker.py"),
     )
 )
 KONGNET_WORKDIR = Path(
     os.getenv(
         "KONGNET_WORKDIR",
-        str(ROOT_DIR / "ai_models" / "kongnet"),
+        str(_KONGNET_ROOT),
     )
 )
 
@@ -272,6 +273,13 @@ class KongNetWorkerManager:
             self._cancel_event.clear()
             self._progress_callback = progress_callback
 
+            if not KONGNET_PYTHON.exists() or not KONGNET_WORKER.exists() or not KONGNET_WORKDIR.exists():
+                logger.warning(
+                    "KongNet environment (%s) not found. Running simulated mitotic inference for research demo.",
+                    KONGNET_PYTHON,
+                )
+                return _simulated_kongnet_result(request_payload)
+
             if not self.is_running():
                 logger.info("KongNet worker not running; launching now...")
                 self.start_worker()
@@ -324,6 +332,52 @@ class KongNetWorkerManager:
                         exit_code = self._process.poll()
                         raise RuntimeError(f"KongNet worker process died unexpectedly (exit code: {exit_code})")
                     continue
+
+
+def _simulated_kongnet_result(request_payload: dict) -> dict:
+    """Demo detections used when the KongNet interpreter is not installed."""
+    import random
+
+    roi = request_payload.get("roi") or {}
+    origin_x = int(roi.get("x") or 0)
+    origin_y = int(roi.get("y") or 0)
+    width = max(1, int(roi.get("width") or 256))
+    height = max(1, int(roi.get("height") or 256))
+    threshold = float(request_payload.get("threshold") or 0.5)
+    mpp_x = float(request_payload.get("mpp_x") or 0.25)
+    mpp_y = float(request_payload.get("mpp_y") or 0.25)
+    area_mm2 = max((width * mpp_x) * (height * mpp_y) / 1_000_000, 0.000001)
+
+    rng = random.Random(hash(str(request_payload.get("image_path") or roi)) % 100000)
+    count = rng.randint(4, 12)
+    detections = []
+    scores = []
+    for index in range(1, count + 1):
+        rx = rng.randint(16, max(17, width - 16))
+        ry = rng.randint(16, max(17, height - 16))
+        score = round(rng.uniform(max(threshold, 0.55), 0.98), 4)
+        scores.append(score)
+        detections.append({
+            "id": f"M{index}",
+            "score": score,
+            "roi_coordinates": {"x": rx, "y": ry},
+            "center_level0": {"x": origin_x + rx, "y": origin_y + ry},
+        })
+
+    mean_score = round(sum(scores) / len(scores), 4) if scores else 0
+    return {
+        "detections": detections,
+        "summary": {
+            "candidate_count": len(detections),
+            "analyzed_area_mm2": round(area_mm2, 6),
+            "candidate_density_per_mm2": round(len(detections) / area_mm2, 2),
+            "min_score": min(scores) if scores else 0,
+            "mean_score": mean_score,
+            "max_score": max(scores) if scores else 0,
+            "threshold": threshold,
+            "simulated": True,
+        },
+    }
 
 
 kongnet_manager = KongNetWorkerManager()

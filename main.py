@@ -108,8 +108,11 @@ app.add_middleware(
 
 # --- Common Slide & Case Resolvers ---
 def stored_path(filename: str) -> Path:
+    if not filename or ".." in Path(filename).parts:
+        raise HTTPException(400, "Invalid stored filename")
     path = (UPLOADS_DIR / filename).resolve()
-    if not filename or path.parent != UPLOADS_DIR.resolve():
+    root = UPLOADS_DIR.resolve()
+    if path == root or root not in path.parents:
         raise HTTPException(400, "Invalid stored filename")
     return path
 
