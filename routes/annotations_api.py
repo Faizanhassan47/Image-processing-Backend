@@ -185,7 +185,7 @@ def create_annotations_router(connect, require_roles, get_current_user, get_slid
                  update.category, update.annotation_status, annotation_id, slide_id)
             )
             db.commit()
-            row = db.execute("SELECT * FROM annotations WHERE id = ?", (annotation_id, slide_id)).fetchone()
+            row = db.execute("SELECT * FROM annotations WHERE id = ? AND slide_id = ?", (annotation_id, slide_id)).fetchone()
         return dict(row)
 
     @router.delete("/api/slides/{slide_id}/annotations/{annotation_id}", status_code=204, dependencies=[Depends(require_roles(pathologist_and_admin))])

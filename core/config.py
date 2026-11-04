@@ -59,3 +59,11 @@ UPLOAD_CHUNK_BYTES = int(os.getenv("UPLOAD_CHUNK_MB", "8")) * 1024 * 1024
 TILE_SIZE = int(os.getenv("TILE_SIZE", "254"))
 TILE_OVERLAP = int(os.getenv("TILE_OVERLAP", "1"))
 RASTER_TYPES = {"image/jpeg": ".jpg", "image/png": ".png"}
+
+# iDrive e2 (S3-compatible). The API uses the regional endpoint plus the bucket name.
+IDRIVE_E2_ENABLED = env_bool("IDRIVE_E2_ENABLED", False)
+IDRIVE_E2_ENDPOINT = os.getenv("IDRIVE_E2_ENDPOINT", "https://s3.ap-southeast-1.idrivee2.com").rstrip("/")
+IDRIVE_E2_REGION = os.getenv("IDRIVE_E2_REGION", "ap-southeast-1")
+IDRIVE_E2_BUCKET = os.getenv("IDRIVE_E2_BUCKET", "vista")
+IDRIVE_E2_ACCESS_KEY_ID = os.getenv("IDRIVE_E2_ACCESS_KEY_ID", "")
+IDRIVE_E2_SECRET_ACCESS_KEY = os.getenv("IDRIVE_E2_SECRET_ACCESS_KEY", "")

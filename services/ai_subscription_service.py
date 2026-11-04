@@ -14,6 +14,12 @@ VALID_STATUSES = {"Active", "Expired", "Cancelled", "Suspended"}
 
 PROTECTED_SUPER_ADMINS = {"etddev", "etdadmin"}
 
+def _published_card(feature):
+    title = str(feature.get("catalog_title") or "").strip()
+    deleted = feature.get("is_catalog_deleted") in (1, True, "1")
+    return bool(title) and not deleted
+
+
 def utcnow_naive():
 
     return datetime.now(timezone.utc).replace(tzinfo=None)

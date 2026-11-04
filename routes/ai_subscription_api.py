@@ -126,7 +126,9 @@ def create_ai_subscription_router(connect, require_roles, get_current_user, audi
             for key in ("is_active", "is_catalog_visible", "is_featured", "is_catalog_deleted"):
                 if key in values:
                     values[key] = 1 if values[key] else 0
-            allowed = {"is_active", "is_catalog_visible", "is_featured", "is_catalog_deleted", "catalog_title", "catalog_display_order", "catalog_category", "catalog_summary", "catalog_purpose", "catalog_value", "catalog_outputs_json", "catalog_session_price_usd", "catalog_usd_to_pkr_rate", "catalog_session_price_pkr"}
+            if values.get("catalog_title") and not values.get("is_catalog_deleted"):
+                values["is_implemented"] = 1
+            allowed = {"is_active", "is_catalog_visible", "is_featured", "is_catalog_deleted", "is_implemented", "catalog_title", "catalog_display_order", "catalog_category", "catalog_summary", "catalog_purpose", "catalog_value", "catalog_outputs_json", "catalog_session_price_usd", "catalog_usd_to_pkr_rate", "catalog_session_price_pkr"}
             if set(values) - allowed:
                 raise HTTPException(400, "Unsupported catalog field")
             assignments = ",".join(f"{key}=?" for key in values)

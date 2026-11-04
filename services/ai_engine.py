@@ -51,6 +51,7 @@ AI_REPORT_DIR = AI_STORAGE / "reports"
 for _dir in (AI_STORAGE, AI_ROI_DIR, AI_GALLERY_DIR, AI_REPORT_DIR):
     _dir.mkdir(parents=True, exist_ok=True)
 
+_AI_MODELS = Path(__file__).resolve().parents[2] / "Ai models" / "hovernet"
 HOVERNET_PYTHON = Path(
     os.getenv(
         "HOVERNET_PYTHON",

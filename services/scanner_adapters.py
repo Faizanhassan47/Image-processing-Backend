@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from services.image_validation import RASTER_EXTENSIONS, WSI_EXTENSIONS, validate_image_file
+from services.image_validation import DICOM_EXTENSIONS, RASTER_EXTENSIONS, WSI_EXTENSIONS, validate_image_file
 
 
 class ScannerAdapter(Protocol):
@@ -61,6 +61,7 @@ class AdapterRegistry:
 ADAPTERS = AdapterRegistry()
 ADAPTERS.register(GenericImageAdapter("generic-raster", frozenset(RASTER_EXTENSIONS)))
 ADAPTERS.register(GenericImageAdapter("generic-openslide", frozenset(WSI_EXTENSIONS)))
+ADAPTERS.register(GenericImageAdapter("generic-dicom", frozenset(DICOM_EXTENSIONS)))
 
 
 class FormatConverter(Protocol):

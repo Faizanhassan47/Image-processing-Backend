@@ -239,4 +239,11 @@ def create_api_router(
             )
         )
 
+        from routes.dip_api import create_dip_router
+        master_router.include_router(create_dip_router(
+            get_current_user_fn=get_current_user_fn,
+            get_slide_fn=get_slide_fn,
+            stored_path_fn=stored_path_fn,
+        ))
+
     return master_router

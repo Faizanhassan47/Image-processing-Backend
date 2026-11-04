@@ -12,6 +12,9 @@ bcrypt<4.0
 pyjwt
 python-dotenv
 pyodbc
+pydicom
+pystrich
+boto3
 pydantic-settings
 structlog
 opencv-python

@@ -788,6 +788,14 @@ def create_ai_router(connect_func, require_roles_func, get_current_user_func, ge
         slide_path = stored_path_func(slide_row["filename"])
         if not slide_path.is_file():
             raise HTTPException(404, f"Slide file '{slide_row['filename']}' is missing on disk.")
+        if slide_row.get("file_type") == "dicom-wsi":
+            with closing(connect_func()) as calibration_db:
+                version = calibration_db.execute(
+                    "SELECT TOP 1 pixel_size_microns FROM image_versions WHERE slide_id=? ORDER BY version DESC",
+                    (slide_id,),
+                ).fetchone()
+            if not version or not version["pixel_size_microns"]:
+                raise HTTPException(422, "DICOM slide has no pixel spacing. Calibrated AI analysis is blocked.")
 
         eff_x = req.x if req.x is not None else req.roi_x
         eff_y = req.y if req.y is not None else req.roi_y

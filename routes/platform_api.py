@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from services.image_validation import ImageValidationError, validate_image_file
+from services.object_storage import delete_case_file
 from services.ai_subscription_service import AISubscriptionService, HOVERNET
 from core.audit_context import get_audit_context
 from services.scanner_adapters import ADAPTERS, CONVERTERS
@@ -848,15 +849,41 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                     validation['duplicate']=True; validation['duplicate_of']=duplicate['id']
                     db.execute("UPDATE ingestion_jobs SET status='Duplicate',progress=100,validation_json=?,completed_at=SYSUTCDATETIME(),error_detail=NULL WHERE id=?",(json.dumps(validation),job_id)); db.commit()
                     return {'id':job_id,'status':'Duplicate','validation':validation}
-            destination=uploads_dir / f"{uuid4().hex}{source.suffix.lower()}"
-            shutil.copy2(source,destination)
+            if validation.get("file_type") == "dicom-wsi":
+                from services.dicom_reader import stage_series
+                stored_name = stage_series(validation, uploads_dir)
+            else:
+                destination=uploads_dir / f"{uuid4().hex}{source.suffix.lower()}"
+                shutil.copy2(source,destination)
+                stored_name = destination.name
             with connect() as db:
                 if not job['matched_case_id']: raise ValueError('Image must be matched to a case before processing')
-                cur=db.execute("INSERT INTO slides (case_id,label,stain,specimen_description,filename,file_type,format,file_size,width,height,level_count,upload_state) VALUES (?,?, '', '', ?,?,?,?,?,?,?,'ready')",(job['matched_case_id'],source.stem[:120] or 'Imported slide',destination.name,validation['file_type'],validation['format'],validation['file_size'],validation['width'],validation['height'],validation['level_count']))
+                from services.slide_identity import identity_conflict
+                conflict = identity_conflict(connect, job['matched_case_id'], validation)
+                if conflict:
+                    db.execute("INSERT INTO reconciliation_items (ingestion_job_id,proposed_case_id,reason) VALUES (?,?,?)", (job_id, None, conflict))
+                    db.execute("UPDATE ingestion_jobs SET status='Quarantined', error_detail=?, completed_at=SYSUTCDATETIME() WHERE id=?", (conflict, job_id))
+                    db.commit()
+                    raise ValueError(conflict)
+                cur=db.execute("INSERT INTO slides (case_id,label,stain,specimen_description,filename,file_type,format,file_size,width,height,level_count,upload_state) VALUES (?,?, '', '', ?,?,?,?,?,?,?,'ready')",(job['matched_case_id'],source.stem[:120] or 'Imported slide',stored_name,validation['file_type'],validation['format'],validation['file_size'],validation['width'],validation['height'],validation['level_count']))
                 calibration=validation['physical_calibration']; pixel_size=calibration['pixel_size_microns_x'] if calibration['available'] else None
-                db.execute("INSERT INTO image_versions (slide_id,version,checksum_sha256,source_path,source_device,pixel_size_microns,metadata_json,stored_filename) VALUES (?,1,?,?,?,?,?,?)",(cur.lastrowid,validation['checksum_sha256'],job['source_path'],job['source_device'],pixel_size,json.dumps(validation),destination.name))
-                db.execute("UPDATE ingestion_jobs SET status='Completed',progress=100,checksum_sha256=?,file_size=?,validation_json=?,stored_filename=?,completed_at=SYSUTCDATETIME(),error_detail=NULL WHERE id=?",(validation['checksum_sha256'],validation['file_size'],json.dumps(validation),destination.name,job_id)); db.commit()
-            return {'id':job_id,'status':'Completed','slide_id':cur.lastrowid,'stored_filename':destination.name,'checksum_sha256':validation['checksum_sha256'],'validation':validation}
+                slide_pk = cur.lastrowid
+                db.execute("INSERT INTO image_versions (slide_id,version,checksum_sha256,source_path,source_device,pixel_size_microns,metadata_json,stored_filename) VALUES (?,1,?,?,?,?,?,?)",(slide_pk,validation['checksum_sha256'],job['source_path'],job['source_device'],pixel_size,json.dumps(validation),stored_name))
+                if validation.get("file_type") == "dicom-wsi":
+                    dicom = validation["dicom"]
+                    study = db.execute("SELECT id FROM dicom_studies WHERE study_instance_uid=?", (dicom["study_instance_uid"],)).fetchone()
+                    if study is None:
+                        study_cur = db.execute("INSERT INTO dicom_studies (study_instance_uid) VALUES (?)", (dicom["study_instance_uid"],))
+                        study_id = study_cur.lastrowid
+                    else:
+                        study_id = study["id"]
+                    series_cur = db.execute("INSERT INTO dicom_series (study_id,series_instance_uid,slide_id,sop_class_uid) VALUES (?,?,?,?)", (study_id, dicom["series_instance_uid"], slide_pk, validation["sop_class_uid"]))
+                    series_folder = stored_name.rsplit("/", 1)[0]
+                    for instance in validation["instances"]:
+                        instance_name = f"{series_folder}/{Path(instance['path']).name}"
+                        db.execute("INSERT INTO dicom_instances (series_id,sop_instance_uid,transfer_syntax_uid,stored_filename) VALUES (?,?,?,?)", (series_cur.lastrowid, instance["sop_instance_uid"], instance.get("transfer_syntax_uid"), instance_name))
+                db.execute("UPDATE ingestion_jobs SET status='Completed',progress=100,checksum_sha256=?,file_size=?,validation_json=?,stored_filename=?,completed_at=SYSUTCDATETIME(),error_detail=NULL WHERE id=?",(validation['checksum_sha256'],validation['file_size'],json.dumps(validation),stored_name,job_id)); db.commit()
+            return {'id':job_id,'status':'Completed','slide_id':cur.lastrowid,'stored_filename':stored_name,'checksum_sha256':validation['checksum_sha256'],'validation':validation}
         except Exception as exc:
             quarantine_path=None
             try:
@@ -932,12 +959,15 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
     @router.delete('/slides/{slide_id}',status_code=204)
     def delete_slide(slide_id:int,user=Depends(require_roles(intake_roles))):
         filenames=[]
+        cloud_identity=(None, None)
         with connect() as db:
             slide=db.execute('SELECT id,case_id,label,filename FROM slides WHERE id=?',(slide_id,)).fetchone()
             if not slide: raise HTTPException(404,'Slide not found')
             versions=db.execute('SELECT id,stored_filename FROM image_versions WHERE slide_id=?',(slide_id,)).fetchall()
             version_ids=[row['id'] for row in versions]
             filenames=list({row['stored_filename'] for row in versions if row.get('stored_filename')} | ({slide['filename']} if slide.get('filename') else set()))
+            owner=db.execute('SELECT TOP 1 p.cnic, p.display_label FROM accessions a JOIN patients p ON p.id=a.patient_id WHERE a.case_id=? ORDER BY a.id DESC',(slide['case_id'],)).fetchone()
+            if owner: cloud_identity=(owner['cnic'], owner['display_label'])
             db.execute('UPDATE report_findings SET annotation_id=NULL WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id=?)',(slide_id,))
             db.execute('UPDATE report_findings SET slide_id=NULL WHERE slide_id=?',(slide_id,))
             db.execute('DELETE FROM annotation_revisions WHERE annotation_id IN (SELECT id FROM annotations WHERE slide_id=?)',(slide_id,))
@@ -973,17 +1003,22 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 shutil.move(str(source),str(destination))
             except OSError:
                 logger.exception('Could not quarantine deleted slide file',extra={'slide_id':slide_id,'filename':filename})
+        for filename in set(filenames):
+            delete_case_file(cloud_identity[0], filename, cloud_identity[1])
         return Response(status_code=204)
 
     @router.delete('/cases/{case_id}',status_code=204)
-    def delete_case(case_id:int,user=Depends(require_roles(administrators))):
+    def delete_case(case_id:int, confirm_finalized: bool = False, user=Depends(require_roles(administrators))):
         filenames=[]
+        cloud_identity=(None, None)
         with connect() as db:
             case=db.execute('SELECT id,case_id,filename,status FROM cases WHERE id=?',(case_id,)).fetchone()
             if not case: raise HTTPException(404,'Case not found')
             finalized_reports=db.execute("SELECT COUNT(*) AS n FROM reports WHERE case_id=? AND status='Finalized'",(case_id,)).fetchone()['n']
-            if finalized_reports:
+            if finalized_reports and not confirm_finalized:
                 raise HTTPException(409, 'Cannot delete a case with finalized reports. Archive the case or create an amended report instead.')
+            owner=db.execute('SELECT TOP 1 p.cnic, p.display_label FROM accessions a JOIN patients p ON p.id=a.patient_id WHERE a.case_id=? ORDER BY a.id DESC',(case_id,)).fetchone()
+            if owner: cloud_identity=(owner['cnic'], owner['display_label'])
             slides=db.execute('SELECT id,filename FROM slides WHERE case_id=?',(case_id,)).fetchall()
             slide_ids=[row['id'] for row in slides]
             filenames.extend(row['filename'] for row in slides if row.get('filename'))
@@ -1041,6 +1076,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 shutil.move(str(source),str(destination))
             except OSError:
                 logger.exception('Could not quarantine deleted case file',extra={'case_id':case_id,'filename':filename})
+        for filename in set(filenames):
+            delete_case_file(cloud_identity[0], filename, cloud_identity[1])
         return Response(status_code=204)
 
     @router.get('/image-versions/{version_id}/metadata-history')
