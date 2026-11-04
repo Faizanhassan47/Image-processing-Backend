@@ -6,7 +6,7 @@ Handles:
 """
 
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from io import BytesIO
 import json
 import os
@@ -112,6 +112,19 @@ def create_cases_router(
         if not val or len(val) > 80:
             raise HTTPException(400, "Case ID must be 1 to 80 characters")
         return val
+
+    def _next_case_id(db, *, lock=False):
+        lock_hint = " WITH (TABLOCKX, HOLDLOCK)" if lock else ""
+        rows = db.execute(f"SELECT case_id FROM cases{lock_hint}").fetchall()
+        numbered = []
+        for row in rows:
+            value = str(row["case_id"] or "").strip()
+            match = re.fullmatch(r"(?:CASE-)?(\d+)", value, re.IGNORECASE)
+            if match:
+                numbered.append(int(match.group(1)))
+        if not numbered:
+            return "CASE-0001"
+        return f"CASE-{max(numbered) + 1:04d}"
 
     def _append_history(db, case_pk, change_type, previous, new, actor):
         db.execute(
@@ -316,6 +329,8 @@ def create_cases_router(
         sort_direction: str = Query("desc"),
         limit: int | None = Query(None, ge=1, le=100),
         offset: int = Query(0, ge=0),
+        date_from: date | None = Query(None),
+        date_to: date | None = Query(None),
         current_user: dict = Depends(get_current_user),
     ):
         clauses = []
@@ -343,6 +358,13 @@ def create_cases_router(
                 raise HTTPException(400, "Status must be New, In Review, or Reviewed")
             clauses.append("CAST(status AS NVARCHAR(100)) = ?")
             params.append(status_filter)
+
+        if date_from:
+            clauses.append("created_at >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("created_at < ?")
+            params.append(date_to + timedelta(days=1))
 
         if reviewer is not None:
             if reviewer.strip() == "":
@@ -382,16 +404,16 @@ def create_cases_router(
 
     @router.post("/api/cases", status_code=201, dependencies=[Depends(require_roles(INTAKE_ROLES))])
     async def create_case(
-        case_id: str = Form(...),
+        case_id: str = Form(""),
         description: str = Form(""),
         image: UploadFile | None = File(None),
         slide_label: str = Form("Slide 1"),
         stain: str = Form(""),
         specimen_description: str = Form(""),
     ):
-        case_code = _validated_case_id(case_id)
         try:
             with closing(connect()) as db:
+                case_code = _validated_case_id(case_id) if case_id.strip() else _next_case_id(db, lock=True)
                 cursor = db.execute(
                     """INSERT INTO cases
                        (case_id, description, filename, file_type, format, width, height, file_size)

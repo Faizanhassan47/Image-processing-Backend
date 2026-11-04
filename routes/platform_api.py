@@ -317,7 +317,7 @@ class AiReview(BaseModel):
     review_status: str; review_note: str = ""
 
 class SettingUpdate(BaseModel):
-    value: str = Field(max_length=4000)
+    value: str = Field(min_length=0, max_length=2_000_000)
 
 class BackupCreate(BaseModel):
     name: str = Field(default="pathology", pattern=r"^[A-Za-z0-9_-]{1,80}$")
@@ -1481,14 +1481,54 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
     def settings(_=Depends(require_roles(administrators))):
         return _rows(connect,'SELECT setting_key,setting_value,updated_by,updated_at FROM system_settings ORDER BY setting_key')
 
+    @router.get('/branding')
+    def branding():
+        with connect() as db:
+            rows = db.execute("SELECT setting_key,setting_value FROM system_settings WHERE setting_key IN ('platform_branding','platform_title','platform_subtitle','platform_logo_data','platform_logo_size','platform_title_size','platform_subtitle_size','platform_theme','platform_primary_color','platform_secondary_color')").fetchall()
+        values = {row['setting_key']: row['setting_value'] for row in rows}
+        try:
+            stored = json.loads(values.get('platform_branding') or '{}')
+            if not isinstance(stored, dict): stored = {}
+        except (TypeError, ValueError):
+            stored = {}
+        values.update({key: value for key, value in stored.items() if value is not None})
+        return {'title': values.get('platform_title') or 'Digital Pathology Platform', 'subtitle': values.get('platform_subtitle') or 'Digital Pathology Platform', 'logo': values.get('platform_logo_data') or None, 'logoSize': values.get('platform_logo_size') or '32', 'titleSize': values.get('platform_title_size') or '14', 'subtitleSize': values.get('platform_subtitle_size') or '10', 'theme': values.get('platform_theme') or 'dark', 'primaryColor': values.get('platform_primary_color') or '#4a90c2', 'secondaryColor': values.get('platform_secondary_color') or '#087f8c'}
+
     @router.put('/settings/{key}')
     def update_setting(key:str,item:SettingUpdate,user=Depends(require_roles(administrators))):
-        allowed={'retention_days','storage_warning_percent','storage_critical_percent','ingestion_max_attempts'}
+        allowed={'retention_days','storage_warning_percent','storage_critical_percent','ingestion_max_attempts','platform_branding','platform_title','platform_subtitle','platform_logo_data','platform_logo_size','platform_title_size','platform_subtitle_size','platform_theme','platform_primary_color','platform_secondary_color'}
         if key not in allowed: raise HTTPException(400,'Unsupported setting')
-        try: value=int(item.value)
-        except ValueError: raise HTTPException(400,'Setting value must be an integer')
-        if value < 1: raise HTTPException(400,'Setting value must be positive')
+        value=item.value.strip()
+        if key == 'platform_branding':
+            try:
+                document = json.loads(value)
+                if not isinstance(document, dict): raise ValueError
+                value = json.dumps(document, separators=(',', ':'))
+            except (TypeError, ValueError):
+                raise HTTPException(400,'Branding setting must be a JSON object')
+        if key.startswith('platform_'):
+            if key == 'platform_title' and not 2 <= len(value) <= 120: raise HTTPException(400,'Platform title must be 2 to 120 characters')
+            if key == 'platform_logo_data' and value and not value.startswith(('data:image/png;base64,','data:image/jpeg;base64,','data:image/svg+xml;base64,')): raise HTTPException(400,'Logo must be a PNG, JPEG, or SVG data URL')
+            if key == 'platform_theme' and value not in {'dark','light'}: raise HTTPException(400,'Theme must be dark or light')
+            if key == 'platform_logo_size':
+                if not value.isdigit() or not 20 <= int(value) <= 64: raise HTTPException(400,'Logo size must be between 20 and 64 pixels')
+            if key == 'platform_title_size' and (not value.isdigit() or not 10 <= int(value) <= 24): raise HTTPException(400,'Title font size must be between 10 and 24 pixels')
+            if key == 'platform_subtitle_size' and (not value.isdigit() or not 8 <= int(value) <= 16): raise HTTPException(400,'Subtitle font size must be between 8 and 16 pixels')
+            if key in {'platform_primary_color','platform_secondary_color'} and (len(value) != 7 or not value.startswith('#') or any(character not in '0123456789abcdefABCDEF' for character in value[1:])): raise HTTPException(400,'Color must be a hexadecimal value')
+        else:
+            try: value=int(value)
+            except ValueError: raise HTTPException(400,'Setting value must be an integer')
+            if value < 1: raise HTTPException(400,'Setting value must be positive')
         with connect() as db:
+            if key.startswith('platform_') and key != 'platform_branding':
+                branding_row = db.execute("SELECT setting_value FROM system_settings WHERE setting_key='platform_branding'").fetchone()
+                try:
+                    branding = json.loads(branding_row['setting_value']) if branding_row and branding_row['setting_value'] else {}
+                    if not isinstance(branding, dict): branding = {}
+                except (TypeError, ValueError):
+                    branding = {}
+                branding[key] = value
+                db.execute("MERGE system_settings AS target USING (SELECT 'platform_branding' AS setting_key) AS source ON target.setting_key=source.setting_key WHEN MATCHED THEN UPDATE SET setting_value=?,updated_by=?,updated_at=SYSUTCDATETIME() WHEN NOT MATCHED THEN INSERT (setting_key,setting_value,updated_by) VALUES (?,?,?);", (json.dumps(branding, separators=(',', ':')), user['username'], json.dumps(branding, separators=(',', ':')), user['username']))
             db.execute("MERGE system_settings AS target USING (SELECT ? AS setting_key) AS source ON target.setting_key=source.setting_key WHEN MATCHED THEN UPDATE SET setting_value=?,updated_by=?,updated_at=SYSUTCDATETIME() WHEN NOT MATCHED THEN INSERT (setting_key,setting_value,updated_by) VALUES (?,?,?);",(key,str(value),user['username'],key,str(value),user['username'])); db.commit()
         return {'setting_key':key,'setting_value':str(value),'updated_by':user['username']}
 
