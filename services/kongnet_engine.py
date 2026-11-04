@@ -71,7 +71,7 @@ _KONGNET_ROOT = ROOT_DIR / "Ai models" / "kongnet"
 KONGNET_PYTHON = Path(
     os.getenv(
         "KONGNET_PYTHON",
-        str(_KONGNET_ROOT / ".venv" / "Scripts" / "python.exe"),
+        r"E:\Pathology-Integrated\kongnet\.venv\Scripts\python.exe",
     )
 )
 KONGNET_WORKER = Path(

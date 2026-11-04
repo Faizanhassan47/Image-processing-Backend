@@ -1,176 +1,246 @@
-"""Digital image processing on a slide region: Otsu, Canny, and CLAHE."""
+"""ROI digital-image-processing routes. Otsu tissue segmentation is the first technique."""
+from contextlib import closing
+import json
+import logging
 
-from pathlib import Path
-import time
-import uuid
-
-import cv2
+from fastapi import APIRouter, Depends, HTTPException, Query
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
-from PIL import Image
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
+import openslide
+
+from core.security import AI_READ_ROLES, AI_RUN_ROLES
+from services.dip_service import (
+    choose_processing_level,
+    load_segmentation_result,
+    apply_clahe,
+    clahe_tile_png,
+    luminance_stats,
+    detect_canny,
+    measure,
+    save_segmentation_result,
+    segment_otsu,
+    validate_dip_roi,
+    visualization_png,
+)
+
+logger = logging.getLogger("pathology.dip")
 
 
-class DipRequest(BaseModel):
+class DipRoi(BaseModel):
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+class DipParameters(BaseModel):
+    gaussian_kernel: int = Field(default=5)
+    low_threshold: int = Field(default=50)
+    high_threshold: int = Field(default=150)
+    clip_limit: float = Field(default=2.0)
+    tile_grid_size: int = Field(default=8)
+
+
+class DipSegmentationRequest(BaseModel):
     algorithm: str
     mode: str = "roi"
-    roi: dict | None = None
-    parameters: dict = Field(default_factory=dict)
+    roi: DipRoi | None = None
+    parameters: DipParameters = Field(default_factory=DipParameters)
 
 
-def create_dip_router(get_current_user_fn, get_slide_fn, stored_path_fn):
-    router = APIRouter(tags=["Digital image processing"])
-    storage = Path(__file__).resolve().parents[1] / "storage" / "dip"
-    storage.mkdir(parents=True, exist_ok=True)
+def create_dip_router(connect_func, require_roles_func, get_slide_func, get_case_func, stored_path_func, require_assigned_case_func):
+    router = APIRouter(tags=["Digital Image Processing"])
 
-    def _read_region(slide_row, body: DipRequest):
-        path = stored_path_fn(slide_row["filename"])
-        if not path.is_file():
-            raise HTTPException(404, "Slide file is missing on disk")
-        try:
-            import openslide
-            slide = openslide.OpenSlide(str(path))
-        except Exception:
-            slide = None
-        if slide is not None:
-            try:
-                full_w, full_h = slide.level_dimensions[0]
-                if body.mode == "whole_slide":
-                    level = slide.level_count - 1
-                    for index, (width, height) in enumerate(slide.level_dimensions):
-                        if max(width, height) <= 2048:
-                            level = index
-                            break
-                    width, height = slide.level_dimensions[level]
-                    image = slide.read_region((0, 0), level, (width, height)).convert("RGB")
-                    return np.array(image), {"x": 0, "y": 0, "width": full_w, "height": full_h}
-                roi = body.roi or {}
-                x, y = int(roi.get("x", 0)), int(roi.get("y", 0))
-                width, height = int(roi.get("width", 0)), int(roi.get("height", 0))
-                if width < 64 or height < 64 or width > 2048 or height > 2048:
-                    raise HTTPException(400, "ROI must be between 64 and 2048 pixels on each side")
-                if x < 0 or y < 0 or x + width > full_w or y + height > full_h:
-                    raise HTTPException(400, "ROI extends beyond slide boundaries")
-                image = slide.read_region((x, y), 0, (width, height)).convert("RGB")
-                return np.array(image), {"x": x, "y": y, "width": width, "height": height}
-            finally:
-                slide.close()
-        with Image.open(path) as raw:
-            rgb = raw.convert("RGB")
-            full_w, full_h = rgb.size
-            if body.mode == "whole_slide":
-                rgb.thumbnail((2048, 2048))
-                return np.array(rgb), {"x": 0, "y": 0, "width": full_w, "height": full_h}
-            roi = body.roi or {}
-            x, y = int(roi.get("x", 0)), int(roi.get("y", 0))
-            width, height = int(roi.get("width", 0)), int(roi.get("height", 0))
-            if x < 0 or y < 0 or x + width > full_w or y + height > full_h:
-                raise HTTPException(400, "ROI extends beyond slide boundaries")
-            return np.array(rgb.crop((x, y, x + width, y + height))), {"x": x, "y": y, "width": width, "height": height}
-
-    def _save(name, image):
-        target = storage / name
-        Image.fromarray(image).save(target, format="PNG")
-        return target.name
+    def _authorized_slide(slide_id, current_user):
+        slide_row = get_slide_func(slide_id)
+        case_row = get_case_func(slide_row["case_id"])
+        require_assigned_case_func(case_row, current_user)
+        return slide_row, case_row
 
     @router.post("/api/slides/{slide_id}/dip/segmentation")
-    def run_segmentation(slide_id: int, body: DipRequest, current_user: dict = Depends(get_current_user_fn)):
-        del current_user
-        slide_row = get_slide_fn(slide_id)
-        started = time.perf_counter()
-        rgb, roi = _read_region(slide_row, body)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        kernel = int(body.parameters.get("gaussian_kernel") or 5)
-        if kernel % 2 == 0:
-            kernel += 1
-        kernel = min(max(kernel, 1), 31)
-        token = uuid.uuid4().hex[:12]
-        algorithm = body.algorithm
-        views = {}
-        payload = {
-            "algorithm": algorithm,
-            "mode": body.mode,
-            "roi": roi,
-            "parameters": body.parameters,
-            "processing": {"width": int(rgb.shape[1]), "height": int(rgb.shape[0])},
-        }
-        if algorithm == "otsu":
-            blurred = cv2.GaussianBlur(gray, (kernel, kernel), 0) if kernel > 1 else gray
-            threshold, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            overlay = rgb.copy()
-            overlay[mask > 0] = (overlay[mask > 0] * 0.45 + np.array([40, 180, 90]) * 0.55).astype(np.uint8)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            drawn = rgb.copy()
-            cv2.drawContours(drawn, contours, -1, (40, 180, 90), 2)
-            views = {
-                "overlay": _save(f"{token}-overlay.png", overlay),
-                "mask": _save(f"{token}-mask.png", cv2.cvtColor(mask, cv2.COLOR_GRAY2RGB)),
-                "contours": _save(f"{token}-contours.png", drawn),
-            }
-            tissue = int(np.count_nonzero(mask))
-            total = int(mask.size)
-            payload.update({
-                "threshold": round(float(threshold), 2),
-                "tissue_coverage_percent": round(100 * tissue / max(total, 1), 2),
-                "foreground_pixel_count": tissue,
-                "background_pixel_count": total - tissue,
-                "contour_count": len(contours),
-                "accuracy_note": "Otsu separates darker tissue from a lighter background on this region. It is a research view, not a diagnosis.",
-            })
-        elif algorithm == "canny":
-            low = float(body.parameters.get("low_threshold") or 50)
-            high = float(body.parameters.get("high_threshold") or 150)
-            if low >= high:
-                raise HTTPException(400, "The low threshold must be lower than the high threshold")
-            blurred = cv2.GaussianBlur(gray, (kernel, kernel), 0) if kernel > 1 else gray
-            edges = cv2.Canny(blurred, low, high)
-            overlay = rgb.copy()
-            overlay[edges > 0] = (220, 70, 70)
-            views = {
-                "overlay": _save(f"{token}-overlay.png", overlay),
-                "mask": _save(f"{token}-mask.png", cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)),
-            }
-            edge_count = int(np.count_nonzero(edges))
-            payload.update({
-                "edge_pixel_count": edge_count,
-                "edge_density_percent": round(100 * edge_count / max(int(edges.size), 1), 2),
-            })
-        elif algorithm == "clahe":
-            clip = float(body.parameters.get("clip_limit") or 2)
-            grid = int(body.parameters.get("tile_grid_size") or 8)
-            grid = min(max(grid, 2), 32)
-            lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-            lightness, a, b = cv2.split(lab)
-            enhanced_l = cv2.createCLAHE(clipLimit=clip, tileGridSize=(grid, grid)).apply(lightness)
-            enhanced = cv2.cvtColor(cv2.merge((enhanced_l, a, b)), cv2.COLOR_LAB2RGB)
-            side = np.concatenate((rgb, enhanced), axis=1)
-            views = {
-                "enhanced": _save(f"{token}-enhanced.png", enhanced),
-                "comparison": _save(f"{token}-comparison.png", side),
-            }
-            payload.update({
-                "original_luminance_mean": round(float(lightness.mean()), 2),
-                "enhanced_luminance_mean": round(float(enhanced_l.mean()), 2),
-                "original_luminance_std": round(float(lightness.std()), 2),
-                "enhanced_luminance_std": round(float(enhanced_l.std()), 2),
-            })
-        else:
-            raise HTTPException(400, "Unsupported image processing algorithm")
-        payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
-        payload["views"] = {name: f"/api/slides/{slide_id}/dip/images/{filename}" for name, filename in views.items()}
-        payload["overlay_url"] = payload["views"].get("overlay") or payload["views"].get("enhanced")
-        return payload
+    def run_segmentation(
+        slide_id: int,
+        request: DipSegmentationRequest,
+        current_user: dict = Depends(require_roles_func(AI_RUN_ROLES)),
+    ):
+        if request.algorithm not in {"otsu", "canny", "clahe"}:
+            raise HTTPException(400, "DIP supports otsu, canny, and clahe")
+        slide_row, case_row = _authorized_slide(slide_id, current_user)
+        suffix = str(slide_row.get("filename") or "").lower()
+        if not suffix.endswith((".svs", ".tif", ".tiff")):
+            raise HTTPException(400, "Otsu segmentation supports SVS and TIFF slides opened with OpenSlide")
+        slide_path = stored_path_func(slide_row["filename"])
+        if not slide_path.is_file():
+            raise HTTPException(404, "Slide file is missing on disk")
+        try:
+            slide = openslide.OpenSlide(str(slide_path))
+        except Exception as exc:
+            raise HTTPException(500, f"Cannot open slide with OpenSlide: {exc}") from exc
+        mode = request.mode or "roi"
+        if mode not in {"roi", "whole_slide"}:
+            slide.close()
+            raise HTTPException(400, "Processing mode must be roi or whole_slide")
+        clahe_crop = None
+        try:
+            slide_width, slide_height = slide.dimensions
+            if mode == "whole_slide":
+                try:
+                    level = choose_processing_level(slide.level_dimensions)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                level_width, level_height = slide.level_dimensions[level]
+                region = slide.read_region((0, 0), level, (level_width, level_height)).convert("RGB")
+                bounds = {"x": 0, "y": 0, "width": slide_width, "height": slide_height, "level": 0}
+                processing = {
+                    "level": level,
+                    "downsample": float(slide.level_downsamples[level]),
+                    "gaussian_kernel": request.parameters.gaussian_kernel,
+                }
+            else:
+                if request.roi is None:
+                    raise HTTPException(400, "Selected ROI segmentation requires a rectangle")
+                roi = request.roi
+                try:
+                    validate_dip_roi(roi.x, roi.y, roi.width, roi.height, slide_width, slide_height)
+                except ValueError as exc:
+                    raise HTTPException(400, str(exc)) from exc
+                pad = 64 if request.algorithm == "clahe" else 0
+                read_x = max(0, roi.x - pad)
+                read_y = max(0, roi.y - pad)
+                read_right = min(slide_width, roi.x + roi.width + pad)
+                read_bottom = min(slide_height, roi.y + roi.height + pad)
+                region = slide.read_region((read_x, read_y), 0, (read_right - read_x, read_bottom - read_y)).convert("RGB")
+                clahe_crop = (roi.x - read_x, roi.y - read_y, roi.width, roi.height) if pad else None
+                bounds = {"x": roi.x, "y": roi.y, "width": roi.width, "height": roi.height, "level": 0}
+                processing = {"level": 0, "downsample": 1.0, "gaussian_kernel": request.parameters.gaussian_kernel}
+        finally:
+            slide.close()
 
-    @router.get("/api/slides/{slide_id}/dip/images/{filename}")
-    def dip_image(slide_id: int, filename: str, current_user: dict = Depends(get_current_user_fn)):
-        del slide_id, current_user
-        if "/" in filename or "\\" in filename or not filename.endswith(".png"):
-            raise HTTPException(400, "Invalid image name")
-        path = (storage / filename).resolve()
-        if path.parent != storage.resolve() or not path.is_file():
-            raise HTTPException(404, "Processing image not found")
-        return FileResponse(path, media_type="image/png")
+        def process():
+            if request.algorithm == "clahe":
+                source = np.array(region)
+                result = apply_clahe(source, request.parameters.clip_limit, request.parameters.tile_grid_size)
+                if clahe_crop:
+                    crop_x, crop_y, crop_width, crop_height = clahe_crop
+                    source = source[crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+                    enhanced = result["image"][crop_y:crop_y + crop_height, crop_x:crop_x + crop_width]
+                    comparison = source.copy()
+                    midpoint = comparison.shape[1] // 2
+                    comparison[:, midpoint:] = enhanced[:, midpoint:]
+                    original_mean, original_std = luminance_stats(source)
+                    enhanced_mean, enhanced_std = luminance_stats(enhanced)
+                    result.update({
+                        "image": enhanced,
+                        "comparison": comparison,
+                        "processing_width": int(enhanced.shape[1]),
+                        "processing_height": int(enhanced.shape[0]),
+                        "original_luminance_mean": original_mean,
+                        "original_luminance_std": original_std,
+                        "enhanced_luminance_mean": enhanced_mean,
+                        "enhanced_luminance_std": enhanced_std,
+                    })
+                return result
+            if request.algorithm == "canny":
+                return detect_canny(
+                    region,
+                    request.parameters.gaussian_kernel,
+                    request.parameters.low_threshold,
+                    request.parameters.high_threshold,
+                )
+            return segment_otsu(region, request.parameters.gaussian_kernel)
+
+        try:
+            segmentation, elapsed_ms = measure(process)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        record = save_segmentation_result(
+            slide_id=slide_id,
+            roi=bounds,
+            segmentation=segmentation,
+            elapsed_ms=elapsed_ms,
+            mode=mode,
+            processing=processing,
+        )
+        try:
+            with closing(connect_func()) as db:
+                db.execute(
+                    "INSERT INTO audit_log (actor_username,action,target_type,target_id,details) VALUES (?,?,?,?,?)",
+                    (current_user["username"], f"dip.{request.algorithm}.requested", "slide", str(slide_id),
+                     json.dumps({"result_id": record["id"], "case_id": case_row["id"], "roi": record["roi"]})),
+                )
+                db.commit()
+        except Exception:
+            logger.exception("Could not write DIP audit record for slide %s", slide_id)
+        return record
+
+    def _view(result_id: str, view: str, current_user):
+        try:
+            record, folder = load_segmentation_result(result_id)
+            payload = visualization_png(folder, view)
+        except FileNotFoundError:
+            raise HTTPException(404, "Segmentation result not found") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        _authorized_slide(int(record["slide_id"]), current_user)
+        return Response(payload, media_type="image/png")
+
+    @router.get("/api/dip/results/{result_id}/overlay")
+    def get_overlay(result_id: str, current_user=Depends(require_roles_func(AI_READ_ROLES))):
+        return _view(result_id, "overlay", current_user)
+
+    @router.get("/api/dip/results/{result_id}/mask")
+    def get_mask(result_id: str, current_user=Depends(require_roles_func(AI_READ_ROLES))):
+        return _view(result_id, "mask", current_user)
+
+    @router.get("/api/dip/results/{result_id}/contours")
+    def get_contours(result_id: str, current_user=Depends(require_roles_func(AI_READ_ROLES))):
+        return _view(result_id, "contours", current_user)
+
+    @router.get("/api/slides/{slide_id}/dip/clahe-tile")
+    def clahe_tile(
+        slide_id: int,
+        x: int = Query(ge=0),
+        y: int = Query(ge=0),
+        width: int = Query(ge=1, le=8192),
+        height: int = Query(ge=1, le=8192),
+        clip_limit: float = Query(ge=1.0, le=5.0),
+        tile_grid_size: int = Query(),
+        current_user: dict = Depends(require_roles_func(AI_READ_ROLES)),
+    ):
+        if tile_grid_size not in {4, 8, 16}:
+            raise HTTPException(400, "CLAHE tile grid size must be 4, 8, or 16")
+        slide_row, _case_row = _authorized_slide(slide_id, current_user)
+        slide_path = stored_path_func(slide_row["filename"])
+        if not slide_path.is_file():
+            raise HTTPException(404, "Slide file is missing on disk")
+        try:
+            slide = openslide.OpenSlide(str(slide_path))
+        except Exception as exc:
+            raise HTTPException(500, f"Cannot open slide with OpenSlide: {exc}") from exc
+        try:
+            payload = clahe_tile_png(
+                slide,
+                x=x,
+                y=y,
+                width=width,
+                height=height,
+                clip_limit=clip_limit,
+                tile_grid_size=tile_grid_size,
+                cache_key=(int(slide_id), int(slide_path.stat().st_mtime), x, y, width, height, float(clip_limit), tile_grid_size),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        finally:
+            slide.close()
+        return Response(payload, media_type="image/png", headers={"Cache-Control": "private, max-age=300"})
+
+    @router.get("/api/dip/results/{result_id}/enhanced")
+    def get_enhanced(result_id: str, current_user=Depends(require_roles_func(AI_READ_ROLES))):
+        return _view(result_id, "enhanced", current_user)
+
+    @router.get("/api/dip/results/{result_id}/comparison")
+    def get_comparison(result_id: str, current_user=Depends(require_roles_func(AI_READ_ROLES))):
+        return _view(result_id, "comparison", current_user)
 
     return router

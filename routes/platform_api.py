@@ -984,6 +984,9 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
             db.execute('DELETE FROM viewer_bookmarks WHERE slide_id=?',(slide_id,))
             db.execute('DELETE FROM viewer_preferences WHERE slide_id=?',(slide_id,))
             db.execute('DELETE FROM slide_qc_history WHERE slide_id=?',(slide_id,))
+            # GrandQC rows reference slides via FK_qc_analyses_slide__552B87C2.
+            # Delete their database records before removing the parent slide.
+            db.execute('DELETE FROM dbo.qc_analyses WHERE slide_id=?',(slide_id,))
             db.execute('DELETE FROM image_versions WHERE slide_id=?',(slide_id,))
             db.execute('DELETE FROM slides WHERE id=?',(slide_id,))
             metadata=get_audit_context()
@@ -1040,6 +1043,8 @@ def create_platform_router(connect, require_roles, get_current_user, uploads_dir
                 db.execute(f'DELETE FROM viewer_bookmarks WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM viewer_preferences WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM slide_qc_history WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
+                # Clear GrandQC records for every slide before deleting parent slides.
+                db.execute(f'DELETE FROM dbo.qc_analyses WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM image_versions WHERE slide_id IN ({slide_marks})',tuple(slide_ids))
                 db.execute(f'DELETE FROM slides WHERE id IN ({slide_marks})',tuple(slide_ids))
             try: db.execute('DELETE FROM ai_analyses WHERE case_id=?',(case_id,))
