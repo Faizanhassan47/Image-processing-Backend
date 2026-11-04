@@ -8,3 +8,5 @@ testdata/
 .venv/
 .env
 storage/
+
+ai_models/kongnet/checkpoints/*.pth

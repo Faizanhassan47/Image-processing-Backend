@@ -1,0 +1,209 @@
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from typing import Callable, Optional
+
+logger = logging.getLogger("pathology.grandqc")
+
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+PROJECT_DIR = BACKEND_DIR.parent
+GRANDQC_ROOT = Path(os.environ.get("GRANDQC_ROOT", r"E:\grandqc")).resolve()
+GRANDQC_PYTHON = Path(
+    os.environ.get("GRANDQC_PYTHON", str(GRANDQC_ROOT / ".venv" / "Scripts" / "python.exe"))
+).resolve()
+GRANDQC_SCRIPT_DIR = Path(
+    os.environ.get("GRANDQC_SCRIPT_DIR", str(GRANDQC_ROOT / "01_WSI_inference_OPENSLIDE_QC"))
+).resolve()
+GRANDQC_OUTPUT_ROOT = Path(
+    os.environ.get("GRANDQC_OUTPUT_ROOT", str(BACKEND_DIR / "storage" / "ai" / "grandqc"))
+).resolve()
+GRANDQC_TIMEOUT_SECONDS = int(os.environ.get("GRANDQC_TIMEOUT_SECONDS", "3600"))
+GRANDQC_MODEL_MPP = 1.5  # validated GrandQC_MPP15.pth
+
+
+class GrandQCError(RuntimeError):
+    pass
+
+
+class GrandQCCancelled(GrandQCError):
+    pass
+
+
+class GrandQCEngine:
+    """Serialize CPU-heavy GrandQC runs, without importing torch into FastAPI."""
+
+    def __init__(self) -> None:
+        self._run_lock = threading.Lock()
+
+    def validate(self) -> dict:
+        required = {
+            "python": GRANDQC_PYTHON,
+            "tissue_script": GRANDQC_SCRIPT_DIR / "wsi_tis_detect.py",
+            "artifact_script": GRANDQC_SCRIPT_DIR / "main.py",
+            "tissue_checkpoint": GRANDQC_SCRIPT_DIR / "models" / "td" / "Tissue_Detection_MPP10.pth",
+            "artifact_checkpoint": GRANDQC_SCRIPT_DIR / "models" / "qc" / "GrandQC_MPP15.pth",
+        }
+        missing = [f"{label}: {path}" for label, path in required.items() if not path.is_file()]
+        if missing:
+            raise GrandQCError("GrandQC environment is incomplete:\n" + "\n".join(missing))
+        return {label: str(path) for label, path in required.items()}
+
+    @staticmethod
+    def _run_command(
+        args: list[str], *, cancel_event: Optional[threading.Event],
+        deadline: float, progress_callback: Optional[Callable[[dict], None]], stage: str,
+    ) -> None:
+        # A single combined pipe is drained continuously to avoid deadlocks.
+        # A reader thread allows cancellation/timeouts even when the model stops logging.
+        import queue
+        q: queue.Queue[Optional[str]] = queue.Queue()
+        proc = subprocess.Popen(
+            args, cwd=str(GRANDQC_SCRIPT_DIR), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+            bufsize=1, shell=False,
+        )
+
+        def reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    q.put(line)
+            finally:
+                q.put(None)
+
+        threading.Thread(target=reader, name=f"GrandQC-{stage}-log", daemon=True).start()
+        tail: list[str] = []
+        try:
+            while True:
+                if cancel_event and cancel_event.is_set():
+                    raise GrandQCCancelled(f"GrandQC {stage} cancelled")
+                if time.monotonic() > deadline:
+                    raise GrandQCError(f"GrandQC {stage} exceeded timeout")
+                try:
+                    line = q.get(timeout=0.5)
+                except queue.Empty:
+                    if proc.poll() is not None:
+                        # Drain is signalled by the reader; continue briefly for remaining lines.
+                        pass
+                    continue
+                if line is None:
+                    break
+                line = line.rstrip()
+                if line:
+                    tail.append(line)
+                    tail = tail[-35:]
+                    logger.info("GrandQC %s: %s", stage, line)
+                    if progress_callback:
+                        progress_callback({"stage": stage, "message": line})
+            code = proc.wait(timeout=5)
+            if code != 0:
+                raise GrandQCError(f"GrandQC {stage} exited with code {code}:\n" + "\n".join(tail))
+        except BaseException:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+            raise
+        finally:
+            if proc.stdout:
+                proc.stdout.close()
+
+    def analyze_slide(
+        self, slide_path: str | Path, *,
+        cancel_event: Optional[threading.Event] = None,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+        job_id: Optional[str] = None,
+    ) -> dict:
+        """Run both stages for exactly one authorized slide path.
+
+        Caller (future FastAPI route) MUST authorize the slide and resolve the path
+        using its existing stored_path_func before invoking this method.
+        """
+        self.validate()
+        src = Path(slide_path).resolve(strict=True)
+        if not src.is_file():
+            raise GrandQCError("Slide must be a regular file")
+        if src.suffix.lower() not in {".svs", ".tif", ".tiff"}:
+            raise GrandQCError("Unsupported slide extension for this OpenSlide pipeline")
+        identifier = job_id or uuid.uuid4().hex
+        if not identifier.isalnum() or len(identifier) > 64:
+            raise GrandQCError("Invalid job identifier")
+        job_root = GRANDQC_OUTPUT_ROOT / identifier
+        input_dir = job_root / "input"
+        output_dir = job_root / "results"
+
+        # Hardlink is same-volume, avoids copying multi-GB WSI into a job folder;
+        # isolated input prevents the original GrandQC scripts from processing ALL uploads.
+        with self._run_lock:
+            input_dir.mkdir(parents=True, exist_ok=False)
+            output_dir.mkdir(parents=True, exist_ok=False)
+            staged = input_dir / src.name
+            try:
+                os.link(src, staged)
+            except OSError as exc:
+                raise GrandQCError(
+                    "Cannot hardlink slide into isolated GrandQC job input. "
+                    "Keep upload storage and GrandQC job storage on the same local volume. "
+                    f"Underlying error: {exc}"
+                ) from exc
+
+            started = time.monotonic()
+            deadline = started + GRANDQC_TIMEOUT_SECONDS
+            common = ["--slide_folder", str(input_dir), "--output_dir", str(output_dir)]
+            try:
+                self._run_command(
+                    [str(GRANDQC_PYTHON), str(GRANDQC_SCRIPT_DIR / "wsi_tis_detect.py"), *common],
+                    cancel_event=cancel_event, deadline=deadline,
+                    progress_callback=progress_callback, stage="tissue",
+                )
+                self._run_command(
+                    [str(GRANDQC_PYTHON), str(GRANDQC_SCRIPT_DIR / "main.py"), *common,
+                     "--mpp_model", str(GRANDQC_MODEL_MPP), "--create_geojson", "Y"],
+                    cancel_event=cancel_event, deadline=deadline,
+                    progress_callback=progress_callback, stage="artifact",
+                )
+                expected = {
+                    "tissue_mask": output_dir / "tis_det_mask" / f"{src.name}_MASK.png",
+                    "artifact_mask": output_dir / "mask_qc" / f"{src.name}_mask.png",
+                    "artifact_map": output_dir / "maps_qc" / f"{src.name}_map_QC.png",
+                    "overlay": output_dir / "overlays_qc" / f"{src.name}_overlay_QC.jpg",
+                    "geojson": output_dir / "geojson_qc" / f"{src.name}.geojson",
+                }
+                missing = [key for key, path in expected.items() if not path.is_file()]
+                if missing:
+                    raise GrandQCError("Inference returned but outputs missing: " + ", ".join(missing))
+                geo = json.loads(expected["geojson"].read_text(encoding="utf-8"))
+                if geo.get("type") != "FeatureCollection":
+                    raise GrandQCError("Invalid GeoJSON result type")
+                result = {
+                    "job_id": identifier, "status": "completed", "model": "GrandQC",
+                    "feature_code": "SLIDE_QUALITY_CONTROL", "slide_name": src.name,
+                    "elapsed_seconds": round(time.monotonic() - started, 2),
+                    "polygon_count": len(geo.get("features", [])),
+                    "output_files": {k: str(v) for k, v in expected.items()},
+                    "research_only": True,
+                }
+                (job_root / "manifest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+                return result
+            finally:
+                # Keep results; discard only hardlink and empty per-job input directory.
+                try:
+                    staged.unlink(missing_ok=True)
+                    input_dir.rmdir()
+                except OSError:
+                    logger.warning("GrandQC input cleanup failed for job %s", identifier)
+
+
+grandqc_manager = GrandQCEngine()

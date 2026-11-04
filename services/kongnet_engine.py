@@ -70,7 +70,7 @@ for _dir in (AI_STORAGE, AI_ROI_DIR, AI_GALLERY_DIR, AI_REPORT_DIR):
 KONGNET_PYTHON = Path(
     os.getenv(
         "KONGNET_PYTHON",
-        r"E:\pathology-ai-models\kongnet\.venv\Scripts\python.exe",
+        r"E:\Pathology-Integrated\kongnet\.venv\Scripts\python.exe",
     )
 )
 KONGNET_WORKER = Path(
