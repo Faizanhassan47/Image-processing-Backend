@@ -267,8 +267,15 @@ class TestImageValidationExtensions:
         assert {".jpg", ".jpeg", ".png"}.issubset(RASTER_EXTENSIONS)
 
     def test_supported_extensions_is_union(self):
-        from services.image_validation import SUPPORTED_EXTENSIONS, RASTER_EXTENSIONS, WSI_EXTENSIONS
-        assert SUPPORTED_EXTENSIONS == RASTER_EXTENSIONS | WSI_EXTENSIONS
+        from services.image_validation import (
+            SUPPORTED_EXTENSIONS,
+            RASTER_EXTENSIONS,
+            WSI_EXTENSIONS,
+            DICOM_EXTENSIONS,
+        )
+        assert SUPPORTED_EXTENSIONS == RASTER_EXTENSIONS | WSI_EXTENSIONS | DICOM_EXTENSIONS
+        assert ".dcm" in SUPPORTED_EXTENSIONS
+        assert ".dicom" in SUPPORTED_EXTENSIONS
 
 
 # ---------------------------------------------------------------------------
