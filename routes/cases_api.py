@@ -60,6 +60,13 @@ def next_case_code(existing_ids) -> str:
     return f"CASE-{highest + 1:04d}"
 
 
+def slide_dzi_url(slide_id: int, file_type: str | None) -> str | None:
+    """Deep Zoom descriptor for OpenSlide-backed whole-slide rows, including DICOM WSI."""
+    if file_type in {"wsi", "dicom-wsi"}:
+        return f"/api/slides/{slide_id}/slide.dzi"
+    return None
+
+
 class ReviewerChange(BaseModel):
     reviewer: str = Field(default="", max_length=120)
 
@@ -153,7 +160,7 @@ def create_cases_router(
         base = f"/api/slides/{item['id']}"
         item["image_url"] = f"{base}/image" if item["file_type"] == "raster" else None
         item["thumbnail_url"] = f"{base}/thumbnail"
-        item["dzi_url"] = f"{base}/slide.dzi" if item["file_type"] == "wsi" else None
+        item["dzi_url"] = slide_dzi_url(item["id"], item.get("file_type"))
         for bool_field in ("qc_missing_tissue", "qc_blur", "qc_scan_artifact", "qc_incorrect_label", "qc_unusual_staining"):
             if bool_field in item and item[bool_field] is not None:
                 item[bool_field] = bool(item[bool_field])

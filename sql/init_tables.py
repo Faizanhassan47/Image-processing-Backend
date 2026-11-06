@@ -149,7 +149,7 @@ def init_db(connect_fn):
                 stain VARCHAR(MAX) NOT NULL DEFAULT '',
                 specimen_description VARCHAR(MAX) NOT NULL DEFAULT '',
                 filename VARCHAR(255) NOT NULL UNIQUE,
-                file_type VARCHAR(MAX) NOT NULL CHECK (file_type IN ('raster', 'wsi')),
+                file_type VARCHAR(MAX) NOT NULL CHECK (file_type IN ('raster', 'wsi', 'dicom-wsi')),
                 format VARCHAR(MAX) NOT NULL,
                 file_size INT NOT NULL,
                 width INT NOT NULL,

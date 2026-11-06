@@ -207,7 +207,7 @@ CREATE TABLE dbo.slides (
     specimen_description   NVARCHAR(MAX) NOT NULL CONSTRAINT DF_slides_specimen DEFAULT (''),
     scanner_name            VARCHAR(255) NULL,
     filename                VARCHAR(255) NOT NULL CONSTRAINT UQ_slides_filename UNIQUE,
-    file_type               VARCHAR(20) NOT NULL CONSTRAINT CK_slides_file_type CHECK (file_type IN ('raster', 'wsi')),
+    file_type               VARCHAR(20) NOT NULL CONSTRAINT CK_slides_file_type CHECK (file_type IN ('raster', 'wsi', 'dicom-wsi')),
     format                  VARCHAR(50) NOT NULL,
     file_size               BIGINT NOT NULL,
     width                   INT NOT NULL,
